@@ -140,8 +140,8 @@ search:
     - html
     - json
   # Local tuning: back off hard and for a long time when an engine rate-limits
-  # or captchas us, because this instance searches from a residential IP and
-  # getting the address blocked is the failure that matters.
+  # or captchas us. Having this instance's egress address blocked is the failure
+  # that actually matters here, and it is slow to undo.
   suspended_times:
     SearxEngineAccessDenied: 0
     SearxEngineCaptcha: 86400

@@ -20,12 +20,13 @@ services:
     # root-only secrets.env by ownership alone.
     user: "${DOCKER_UID:-2100}:${DOCKER_GID:-2100}"
     # Bind to one address, not every interface. This instance has no auth and
-    # `limiter: false`, and it is reached by an HAProxy that lives on another
-    # host, so publishing on 0.0.0.0 put an open search proxy on the LAN and on
-    # every libvirt/docker bridge. Docker's published ports are DNAT'd ahead of
-    # the INPUT chain, so a host firewall would not have covered this without an
-    # explicit DOCKER-USER rule. The address is deployment-specific and so lives
-    # in /tank/searxng/deploy.env, not here; the fallback is fail-closed.
+    # `limiter: false`, so every interface the port is published on is an open
+    # search proxy -- one that issues arbitrary outbound HTTP attributed to this
+    # host, with the search engines blocking that address as the practical
+    # consequence. Note Docker publishes ports via DNAT ahead of the INPUT chain,
+    # so a host firewall does not cover this without an explicit DOCKER-USER
+    # rule. Which address to use is deployment-specific and so lives in
+    # /tank/searxng/deploy.env, not here; the fallback is fail-closed.
     ports:
       - "${SEARXNG_BIND_ADDR:-127.0.0.1}:8080:8080"
     volumes:
@@ -43,8 +44,8 @@ services:
       # Without this the cache/ volume is decoration. SearXNG builds every
       # ExpireCache under tempfile.gettempdir(), which is /tmp -- inside the
       # container's ephemeral layer -- so the engine-token and favicon caches
-      # were destroyed on every image update and the instance immediately
-      # re-solicited tokens from the search engines from a residential IP.
+      # were destroyed on every image update, and the instance immediately
+      # re-solicited tokens from the search engines afterwards.
       # Verified: /var/cache/searxng held nothing while /tmp held
       # sxng_cache_ENGINES_CACHE.db with a ~900 KB WAL. Python's tempfile
       # honours TMPDIR, so this puts the caches on the volume that was already
