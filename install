@@ -40,7 +40,7 @@ die() { echo "install: $*" >&2; exit 1; }
 # else would enable units pointing at a tree that isn't the one you just edited.
 [ "$PWD" = /opt/searxng ] || die "must be installed at /opt/searxng (found $PWD); the systemd units hardcode that path"
 
-for cmd in docker zfs zpool envsubst openssl systemctl adduser findmnt curl; do
+for cmd in docker zfs zpool envsubst openssl systemctl adduser findmnt curl python3; do
     command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
@@ -116,7 +116,14 @@ mkdir -p "$ROOT/config" "$ROOT/cache"
 #    being destroyed on every image update, and the instance re-solicited tokens
 #    from the search engines immediately afterwards. A non-empty volume skips
 #    copy-up entirely, which makes the ownership stable instead of a race.
-touch "$ROOT/cache/.keep"
+# NOT `touch`. cache/ is bind-mounted rw into the container, whose processes
+#    run as the uid that OWNS this directory, and touch(1) follows symlinks and
+#    creates the target -- so a planted dangling link here would have made root
+#    create an arbitrary file anywhere on the host, mode 0644, on the next run.
+#    /usr/bin/install unlinks the destination and creates it O_EXCL instead
+#    (verified: it replaced a symlink with a regular file and left the target
+#    untouched), which is the same reason the render below uses rename(2).
+/usr/bin/install -o searxng -g searxng -m 0644 /dev/null "$ROOT/cache/.keep"
 
 #    A named volume freezes its bind device at CREATION and does not re-read it
 #    from compose.yml on later `up` runs. Changing `device:` therefore produces
@@ -130,8 +137,13 @@ if docker volume inspect searxng_searxng >/dev/null 2>&1; then
     systemctl stop searxng.service && docker volume rm searxng_searxng && $PWD/install"
 fi
 for v in config cache; do
+    # Existence and device are tested SEPARATELY on purpose. A plain local volume
+    # created without driver_opts reports an empty device and exit 0, so a single
+    # `[ -n "$have" ]` test passed exactly the case this guard exists for: a
+    # stale searxng_config that silently keeps mounting somewhere else.
+    docker volume inspect "searxng_$v" >/dev/null 2>&1 || continue
     have=$(docker volume inspect "searxng_$v" --format '{{index .Options "device"}}' 2>/dev/null || true)
-    if [ -n "$have" ] && [ "$have" != "$ROOT/$v" ]; then
+    if [ "$have" != "$ROOT/$v" ]; then
         die "volume searxng_$v is bound to '$have', not '$ROOT/$v'. Docker never re-reads device: from compose.yml, so this cannot be fixed by editing it.
     systemctl stop searxng.service && docker volume rm searxng_$v && $PWD/install"
     fi
@@ -262,8 +274,16 @@ find "$ROOT" -maxdepth 1 -type f \
 #    re-assert root-only on the credential file the sweep just touched. It sits
 #    at the dataset root, which compose does not bind-mount (only config/ and
 #    cache/ are), so the container never sees it.
-chown -R searxng:searxng "$ROOT"
-chown root:root "$SECRETS"
+chown -R searxng:searxng "$ROOT/config" "$ROOT/cache"
+#    The dataset ROOT and both files in it stay root-owned. deploy.env is read
+#    by systemd as an EnvironmentFile and parsed by check-update as root, and
+#    systemd applies EnvironmentFile AFTER Environment=, so a writable
+#    deploy.env could set DOCKER_UID=0 and put the container back to running as
+#    root -- the one state in which it can read secrets.env by ownership alone.
+#    Root-owning the directory also means nothing but root can unlink the files
+#    in it, which is what actually protects a 0600 file.
+chown root:root "$ROOT" "$SECRETS" "$DEPLOY_ENV"
+chmod 0755 "$ROOT"
 chmod 0600 "$SECRETS"
 chmod 0644 "$DEPLOY_ENV"
 
@@ -299,7 +319,8 @@ systemctl start searxng-update.timer
 #     fine, and then crash-loops inside the container. Editing the template and
 #     re-running is the most common operation in this repo, so that is exactly
 #     the failure this must catch. /healthz needs no auth.
-health_url="http://${SEARXNG_BIND_ADDR}:8080/healthz"
+health_base="http://${SEARXNG_BIND_ADDR}:8080"
+health_url="$health_base/healthz"
 for _ in $(seq 60); do
     if curl -fsS --max-time 2 -o /dev/null "$health_url" 2>/dev/null; then
         ok=1; break
@@ -311,27 +332,45 @@ done
     docker logs --tail 20 searxng
     journalctl -u searxng -n 30"
 
-# 13. Answering is not the same as answering with the engines you configured.
-#     A name in settings.yml.tmpl that the image has no module for is OUR bug
-#     and it is silent: the engine simply does not exist, results are quietly
-#     thinner, and the healthcheck stays green. That is what happened to the
-#     reddit and presearch entries, which logged a traceback on every start for
-#     months. Fatal, because re-running after removing the name is the fix.
-if bad=$(docker logs searxng 2>&1 | grep -oP 'Cannot load engine "\K[^"]+' | sort -u) && [ -n "$bad" ]; then
-    die "the image has no module for these engines named in settings.yml.tmpl:
-$(printf '%s\n' "$bad" | sed 's/^/    /')
-  Remove them from the keep_only list and re-run."
+# 13. Answering is not the same as answering with the engines you configured,
+#     and under the delta model that failure is completely silent: keep_only is
+#     a pure filter, so a name upstream renames or retires simply matches
+#     nothing and is dropped without a log line. Grepping the log for load
+#     errors therefore cannot catch it -- the old check here was dead code.
+#     Assert positively instead: every name in keep_only must come back in
+#     /config. This is the check that would have caught the reddit and presearch
+#     entries, which sat broken for months behind a green healthcheck.
+missing=$(python3 - "$health_base" <<'PYEOF' || true
+import json, re, sys, urllib.request
+want = set()
+block = False
+for line in open("settings.yml.tmpl"):
+    if re.match(r"^\s*keep_only:", line):
+        block = True; continue
+    if block:
+        m = re.match(r"^\s+- (.+?)\s*$", line)
+        if m: want.add(m.group(1))
+        elif line.strip() and not line.lstrip().startswith("#"): break
+live = {e["name"] for e in json.load(urllib.request.urlopen(sys.argv[1] + "/config", timeout=10))["engines"]}
+print("\n".join(sorted(want - live)))
+PYEOF
+)
+if [ -n "$missing" ]; then
+    die "these engines are whitelisted in settings.yml.tmpl but did not load:
+$(printf '%s\n' "$missing" | sed 's/^/    /')
+  Either upstream renamed or retired them, or they need credentials. Remove
+  them from keep_only (or fix them) and re-run."
 fi
+
 #     An engine that failed to INITIALISE is a different thing: usually a
-#     transient 403 or timeout from the engine's own site at startup. It is not
-#     a config error and must not fail a deploy -- but it is worth saying out
-#     loud, because initialisation happens once per worker and a single bad
-#     moment at boot leaves that engine dead, and advertised, until the next
-#     restart.
-if warn=$(docker logs searxng 2>&1 | grep -oP "\(PID [0-9]+\) \K[^:]+(?=: can't register engines processor)" | sort -u) && [ -n "$warn" ]; then
-    echo "install: WARNING -- these engines did not initialise and will stay dead until the next restart:" >&2
+#     transient block from the engine's own site at startup. Not a config error,
+#     so it must not fail a deploy -- but worth saying out loud, because
+#     initialisation happens once per worker, so one bad moment at boot leaves
+#     that engine dead, and still advertised, until the next restart.
+warn=$(docker logs searxng 2>&1 | grep -oP "\(PID [0-9]+\) \K[^:]+(?=: can't register engines processor)" | sort -u || true)
+if [ -n "$warn" ]; then
+    echo "install: WARNING -- these engines did not initialise and stay dead until the next restart:" >&2
     printf '%s\n' "$warn" | sed 's/^/    /' >&2
-    echo "  Usually a transient block from the engine's own site. Re-check with: docker logs searxng | grep register" >&2
 fi
 
 echo "install: searxng converged and answering on $health_url"

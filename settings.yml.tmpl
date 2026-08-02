@@ -22,13 +22,15 @@ use_default_settings:
     # silently start fanning queries out to third parties nobody chose. Adding an
     # engine means adding its name here; there is nothing else to reconcile.
     #
-    # Deliberately ABSENT, having been verified dead from this host rather than
-    # assumed: google and google videos return zero results with no error (they
-    # are silently blocked, which is why upstream ships them inactive),
-    # yahoo news returns an HTTP protocol error, z-library refuses the
-    # connection, and wallhaven returns nothing. Upstream marks all five
-    # `inactive: true`; that judgement was checked, not taken on faith, and it
-    # matched. Re-add a name here if upstream revives it.
+    # Upstream marks 67 engines `inactive: true`, which stops them loading at
+    # all. All 67 were probed from this host with three different queries rather
+    # than trusted: 32 of them work fine, and six of those are re-enabled in the
+    # engines: block below. Deliberately still ABSENT, because they were
+    # measured dead here: google and google videos (zero results, no error --
+    # silently blocked), yahoo news (HTTP protocol error), z-library (connection
+    # refused), heexy and ebay (access denied), and searchzee (rate limited).
+    # Re-probe before re-adding any of them; upstream's flag is a starting point,
+    # not the answer.
     keep_only:
       - arch linux wiki
       - artic
@@ -92,14 +94,19 @@ use_default_settings:
       - qwant news
       - qwant videos
       - radio browser
+      - repology
       - sepiasearch
       - solidtorrents
       - soundcloud
       - stackoverflow
       - superuser
+      - swisscows
+      - swisscows images
+      - swisscows videos
       - tootfinder
       - unsplash
       - vimeo
+      - wallhaven
       - wikicommons.audio
       - wikicommons.files
       - wikicommons.images
@@ -219,9 +226,32 @@ engines:
     shortcut: def
   - name: yahoo
     disabled: false
-  # The one exception to upstream's `inactive: true` verdict. Measured from this
-  # host: google web search returns zero results every time, but google images
-  # consistently returns ~100. Upstream deactivates the whole family together;
-  # this instance keeps the half that works.
+  # Engines upstream ships `inactive: true` that were measured WORKING from this
+  # host, so they are switched back on. Upstream deactivates a family as a unit
+  # (all of google, all of swisscows), which is why enabling half of one is
+  # normal rather than a mistake.
+  #
+  #   google images  ~100 results, while google web returns zero -- keep the half that works
+  #   swisscows*     independent Swiss privacy engine; general/images/videos. Its
+  #                  news endpoint returns an HTTP error every time and is left out.
+  #   repology       ~200 results; the packages category otherwise has almost nothing
+  #   wallhaven      wallpapers. It was briefly dropped on a bad test: it was probed
+  #                  with a film title, and a wallpaper site reasonably returned
+  #                  nothing. It returns 24 for "linux". Probe engines with a query
+  #                  their own category would actually answer.
   - name: google images
+    inactive: false
+  - name: repology
+    inactive: false
+    disabled: false
+  - name: swisscows
+    inactive: false
+    disabled: false
+  - name: swisscows images
+    inactive: false
+    disabled: false
+  - name: swisscows videos
+    inactive: false
+    disabled: false
+  - name: wallhaven
     inactive: false

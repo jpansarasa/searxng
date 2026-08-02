@@ -20,9 +20,13 @@ export DOCKER_UID="${DOCKER_UID:-2100}" DOCKER_GID="${DOCKER_GID:-2100}"
 # gets it from the same file they use, then falls back to the same default.
 # (`if` rather than `[ -r ] && .` -- the latter returns 1 when absent and would
 # trip set -e.)
+# PARSED, never sourced. `.` executes the file as root, and "it is root-owned"
+# is a property that has to be re-established on every install run rather than
+# assumed -- which is exactly the reasoning that moved secrets.env off sourcing.
 if [ -r /tank/searxng/deploy.env ]; then
-    # shellcheck source=/dev/null
-    . /tank/searxng/deploy.env
+    tag=$(grep -m1 -oP '^SEARXNG_TAG=\K.*' /tank/searxng/deploy.env 2>/dev/null || true)
+    tag=${tag%$'\r'}; tag=${tag#\"}; tag=${tag%\"}
+    [ -n "$tag" ] && SEARXNG_TAG="$tag"
 fi
 export SEARXNG_TAG="${SEARXNG_TAG:-latest}"
 

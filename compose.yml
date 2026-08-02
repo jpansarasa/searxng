@@ -40,6 +40,16 @@ services:
       # rewrite the dataset to uid 977 and leave the next normal start unable to
       # read its own config. Refuse it rather than rely on never making it.
       - FORCE_OWNERSHIP=false
+      # Without this the cache/ volume is decoration. SearXNG builds every
+      # ExpireCache under tempfile.gettempdir(), which is /tmp -- inside the
+      # container's ephemeral layer -- so the engine-token and favicon caches
+      # were destroyed on every image update and the instance immediately
+      # re-solicited tokens from the search engines from a residential IP.
+      # Verified: /var/cache/searxng held nothing while /tmp held
+      # sxng_cache_ENGINES_CACHE.db with a ~900 KB WAL. Python's tempfile
+      # honours TMPDIR, so this puts the caches on the volume that was already
+      # being mounted for them.
+      - TMPDIR=/var/cache/searxng
     cap_drop:
       - ALL
     # No cap_add. The upstream-recommended CHOWN/SETGID/SETUID/DAC_OVERRIDE set

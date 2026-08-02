@@ -28,6 +28,12 @@ Two files on the ZFS dataset, by design — the repo stays safe to publish:
 | `/tank/searxng/secrets.env` | `SEARXNG_SECRET_KEY` (generated), `SEARXNG_BASE_URL` (**you**) | `install` seeds it; you fill in the base URL |
 | `/tank/searxng/deploy.env` | `SEARXNG_BIND_ADDR` (**you**), `SEARXNG_TAG` (optional pin) | `install` seeds it; you fill in the address |
 
+Both are `root:root`, as is the dataset root itself. That matters for `deploy.env`
+specifically: systemd applies `EnvironmentFile=` **after** `Environment=`, so a
+writable `deploy.env` could set `DOCKER_UID=0` and put the container back to
+running as root — the one state in which it can read `secrets.env` by ownership
+alone. Neither file is ever sourced; both are parsed for known keys only.
+
 `install` generates what it can and refuses to invent what it cannot. It names
 every unset value at once and exits, so a fresh machine takes exactly one
 correction round rather than one per variable.
@@ -79,7 +85,7 @@ timer's journal instead of looking like "no updates".
 
 Prerequisites: Docker with the compose plugin, ZFS with a pool named `tank`,
 `envsubst` (`gettext-base`), `openssl`, `findmnt` (`util-linux`), `curl`,
-systemd.
+`python3`, systemd.
 
 ```bash
 sudo git clone https://github.com/jpansarasa/searxng.git /opt/searxng
@@ -127,9 +133,12 @@ answers, so a zero exit means "serving", not merely "systemd accepted the job".
 That distinction is the whole point: a bad value in `settings.yml.tmpl` renders
 cleanly and starts cleanly, then crash-loops inside the container. Since editing
 the template and re-running is the most common operation here, that is the
-failure most likely to be introduced. It then checks the container log for
-engines the image has no module for — a silent failure that leaves results
-quietly thinner while everything stays green.
+failure most likely to be introduced. It then asserts that every engine named in
+`keep_only` actually came back in `/config`. That check has to be positive
+rather than a log grep: `keep_only` is a pure filter, so a name upstream renames
+or retires matches nothing and is dropped **silently**, leaving results quietly
+thinner while everything stays green. That is exactly how the `reddit` and
+`presearch` entries stayed broken for months.
 
 ### Pinning a bad release
 

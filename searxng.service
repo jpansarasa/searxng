@@ -75,6 +75,20 @@ ExecStartPre=/bin/sh -c '/usr/bin/findmnt --type zfs --source tank/searxng --mou
 # the cgroup on every retry.
 ExecStartPre=/usr/bin/timeout 10 /bin/sh -c 'test -s /tank/searxng/config/settings.yml || { echo "<3>searxng: /tank/searxng/config/settings.yml is missing or empty -- refusing to start, because the entrypoint would generate a default config with a throwaway secret. Run /opt/searxng/install. Retrying every 30s."; exit 1; }'
 
+# Third guard, and it exists because of the second one's timing. systemd reads
+# EnvironmentFile ONCE per start attempt, BEFORE any ExecStartPre runs. On a boot
+# where the pool is late, deploy.env does not exist at that moment, so
+# SEARXNG_BIND_ADDR is unset -- and `-` means that is not an error. Almost always
+# the findmnt guard below then fails and the whole cycle repeats, and systemd
+# genuinely does re-read the file on each auto-restart (measured on this host, not
+# assumed), so it self-heals. The gap is the cycle where the mount lands BETWEEN
+# the environment read and the findmnt check: findmnt passes, the address is still
+# empty, and compose falls back to 127.0.0.1. That failure is the bad kind --
+# the unit goes active and stays there, healthcheck green, while the reverse proxy
+# on the other host can no longer reach it. Asserting the value is set turns that
+# into one more 30s retry.
+ExecStartPre=/bin/sh -c 'test -n "${SEARXNG_BIND_ADDR}" || { echo "<3>searxng: SEARXNG_BIND_ADDR is empty -- /tank/searxng/deploy.env was unreadable when systemd read the environment (late pool import?). Refusing to start rather than publishing on the loopback fallback where the reverse proxy cannot reach it. Retrying every 30s."; exit 1; }'
+
 # No `-` prefix on either exec line. It would record a real compose failure as
 # Result=success: the journal logs a clean deactivation instead of "Failed with
 # result 'exit-code'", nothing keyed on PRIORITY=3 fires, and if Restart= is
