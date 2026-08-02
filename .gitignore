@@ -1,0 +1,13 @@
+# Rendered output, not source. The live copy lives at /tank/searxng/settings.yml
+# and contains the secret_key. Source of truth is settings.yml.tmpl.
+settings.yml
+
+# Orphaned landing page: not deployed by install, compose, or the unit.
+index.html
+
+# Local cruft from in-place editing on the host.
+*.bak
+*.save
+*.log
+*.orig
+*.new

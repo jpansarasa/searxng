@@ -1,0 +1,19 @@
+# This configuration file updates the default configuration file
+# See https://docs.searxng.org/admin/searx.limiter
+
+[botdetection.ip_limit]
+# activate link_token method in the ip_limit method
+link_token = false
+
+[botdetection.ip_lists]
+block_ip = []
+pass_ip = [
+    "10.0.0.0/8",      # RFC 1918 - Class A private network
+    "172.16.0.0/12",   # RFC 1918 - Class B private network  
+    "192.168.0.0/16",  # RFC 1918 - Class C private network
+    "127.0.0.0/8",     # Loopback addresses
+    "169.254.0.0/16",  # Link-local addresses
+    "::1/128",         # IPv6 loopback
+    "fc00::/7",        # IPv6 unique local addresses
+    "fe80::/10"        # IPv6 link-local addresses
+]

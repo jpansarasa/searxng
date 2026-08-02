@@ -1,0 +1,12 @@
+[Unit]
+Description=SearXNG image update check (fetch :latest, notify if newer than running)
+Documentation=file:/opt/searxng/check-update
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/searxng/compose.yml
+
+[Service]
+Type=oneshot
+Environment=DOCKER_UID=2100 DOCKER_GID=2100
+ExecStart=/opt/searxng/check-update

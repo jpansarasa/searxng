@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# Idempotent (re)install / redeploy for the SearXNG service.
+#
+# Safe to run repeatedly: every run converges to the desired state and does not
+# error on things that already exist. Config is rendered FROM this directory
+# (the source of truth) TO the live bind-mount at /tank/searxng.
+#
+# The one secret is NOT in this repo. settings.yml is rendered from
+# settings.yml.tmpl using /tank/searxng/secrets.env, which is root-only. Unlike
+# ntfy's VAPID key that secret is disposable, so this script generates one if
+# it is missing rather than making you supply it.
+#
+set -euo pipefail
+
+# Always operate relative to this script's own directory, wherever it's run from.
+cd "$(dirname "$(readlink -f "$0")")"
+
+ROOT=/tank/searxng
+DATASET=tank/searxng
+SVC_UID=2100
+SECRETS="$ROOT/secrets.env"
+
+die() { echo "install: $*" >&2; exit 1; }
+
+# 0. Preconditions. Fail loudly and early rather than half-converging: a run
+#    that dies midway leaves a live service with a half-applied config.
+[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo ./install)"
+
+# The systemd units hardcode /opt/searxng and /tank/searxng. A clone anywhere
+# else would enable units pointing at a tree that isn't the one you just edited.
+[ "$PWD" = /opt/searxng ] || die "must be installed at /opt/searxng (found $PWD); the systemd units hardcode that path"
+
+for cmd in docker zfs zpool envsubst openssl systemctl adduser; do
+    command -v "$cmd" >/dev/null || die "missing required command: $cmd"
+done
+docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
+zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
+
+# 1. Service user (uid/gid 2100, matches DOCKER_UID/DOCKER_GID in searxng.service)
+if ! getent passwd searxng >/dev/null; then
+    adduser --system --group --uid "$SVC_UID" searxng
+fi
+
+# 2. ZFS dataset backing the live config.
+#
+#    Note this dataset is NOT replicated -- replication is opt-in per dataset
+#    and searxng is deliberately not opted in. Everything here is either in
+#    this repo or regenerable, which is why the secret below is generated
+#    rather than restored.
+if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
+    zfs create -p "$DATASET"
+fi
+
+# 3. Secret. Generated on first run: it only signs preference URLs and limiter
+#    tokens, so a new one costs nothing but invalidating saved preference
+#    links. Never regenerated once present, so repeat runs are stable.
+if [ ! -r "$SECRETS" ]; then
+    (umask 077; { printf 'SEARXNG_SECRET_KEY=%s\n' "$(openssl rand -hex 32)"
+                  printf 'SEARXNG_BASE_URL=\n'; } > "$SECRETS")
+    echo "install: seeded $SECRETS with a generated secret key" >&2
+fi
+set -a
+# shellcheck source=/dev/null
+. "$SECRETS"
+set +a
+[ -n "${SEARXNG_SECRET_KEY:-}" ] || die "SEARXNG_SECRET_KEY is unset or empty in $SECRETS"
+# Cannot be generated: it is this instance's own public URL.
+[ -n "${SEARXNG_BASE_URL:-}" ] || die "SEARXNG_BASE_URL is unset or empty in $SECRETS -- set it to this instance's public URL, e.g. https://searxng.example.com/"
+
+# 4. Render config: template (this dir) + secret -> live mount.
+#    envsubst gets an explicit variable list so ONLY this placeholder is
+#    substituted; every other $-sequence in the upstream settings survives.
+#    Rendered to a temp file and moved into place so a failure here can never
+#    leave a truncated settings.yml behind. 0640 because it holds the key.
+#    /usr/bin/install is spelled out: this script is itself named `install`.
+# shellcheck disable=SC2016  # the single quotes are envsubst's variable list, not an expansion
+envsubst '${SEARXNG_SECRET_KEY} ${SEARXNG_BASE_URL}' < settings.yml.tmpl > "$ROOT/.settings.yml.new"
+/usr/bin/install -o searxng -g searxng -m 0640 "$ROOT/.settings.yml.new" "$ROOT/settings.yml"
+rm -f "$ROOT/.settings.yml.new"
+/usr/bin/install -o searxng -g searxng -m 0644 limiter.toml "$ROOT/limiter.toml"
+
+# 5. Ownership (belt-and-suspenders; the container runs as uid 2100), then
+#    re-assert root-only on the secret the sweep just touched.
+chown -R searxng:searxng "$ROOT"
+chown root:root "$SECRETS"
+chmod 0600 "$SECRETS"
+
+# 6. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
+#    pulls on start (updates come from searxng-update.timer), so the override
+#    is not just unneeded but would re-add a pull. Safe if already absent.
+rm -f /etc/systemd/system/searxng.service.d/pull-not-on-boot.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/searxng.service.d 2>/dev/null || true
+
+# 7. Register units (idempotent). `enable` installs the /opt symlink for the
+#    main service and the timer; the oneshot update service has no [Install]
+#    section, so it is `link`ed instead so the timer can resolve it by name.
+systemctl enable "$PWD/searxng.service"
+if ! systemctl cat searxng-update.service >/dev/null 2>&1; then
+    systemctl link "$PWD/searxng-update.service"
+fi
+systemctl enable "$PWD/searxng-update.timer"
+systemctl daemon-reload
+
+# 8. Apply: (re)start the service (picks up any staged image + config) and
+#    activate the update timer now (it was enabled above).
+systemctl restart searxng.service
+systemctl start searxng-update.timer
+
+echo "install: searxng converged."

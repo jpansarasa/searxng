@@ -1,0 +1,36 @@
+name: searxng
+
+services:
+  searxng:
+    container_name: searxng
+    image: docker.io/searxng/searxng:latest
+    restart: unless-stopped
+    user: "${DOCKER_UID}:${DOCKER_GID}"
+    ports:
+      - 8080:8080
+    volumes:
+      - searxng:/etc/searxng:rw
+    environment:
+      - TZ=America/New_York
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider --header='X-Forwarded-For: 127.0.0.1' http://0.0.0.0:8080 || exit 1"]
+      interval: 1m30s
+      timeout: 5s
+      start_period: 30s
+      start_interval: 5s
+      retries: 3
+
+volumes:
+  searxng:
+    driver: local
+    driver_opts:
+      type: none
+      device: /tank/searxng
+      o: bind
