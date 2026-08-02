@@ -4,12 +4,16 @@
 #
 # Safe to run repeatedly: every run converges to the desired state and does not
 # error on things that already exist. Config is rendered FROM this directory
-# (the source of truth) TO the live bind-mount at /tank/searxng.
+# (the source of truth) TO the live bind-mount at /tank/searxng/config.
 #
-# The one secret is NOT in this repo. settings.yml is rendered from
-# settings.yml.tmpl using /tank/searxng/secrets.env, which is root-only. Unlike
-# ntfy's VAPID key that secret is disposable, so this script generates one if
-# it is missing rather than making you supply it.
+# Nothing deployment-specific is in this repo. settings.yml is rendered from
+# settings.yml.tmpl using /tank/searxng/secrets.env, which is root-only and
+# lives at the DATASET ROOT -- a directory compose deliberately does not
+# bind-mount, so the container cannot see it. Unlike ntfy's VAPID key the
+# secret_key is disposable, so this script generates one if it is missing rather
+# than making you supply it; the base URL is not, so it asks.
+#
+# NOTE: the last step restarts searxng, briefly dropping in-flight searches.
 #
 set -euo pipefail
 
@@ -19,7 +23,12 @@ cd "$(dirname "$(readlink -f "$0")")"
 ROOT=/tank/searxng
 DATASET=tank/searxng
 SVC_UID=2100
+# Root-only, at the dataset root: not bind-mounted, so out of the container's
+# reach. Holds the two values that must not be public.
 SECRETS="$ROOT/secrets.env"
+# Not secret, but deployment-specific and needed by systemd at start time (it
+# reaches compose as an interpolation), so it cannot live in the repo either.
+DEPLOY_ENV="$ROOT/deploy.env"
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -31,15 +40,38 @@ die() { echo "install: $*" >&2; exit 1; }
 # else would enable units pointing at a tree that isn't the one you just edited.
 [ "$PWD" = /opt/searxng ] || die "must be installed at /opt/searxng (found $PWD); the systemd units hardcode that path"
 
-for cmd in docker zfs zpool envsubst openssl systemctl adduser; do
+for cmd in docker zfs zpool envsubst openssl systemctl adduser findmnt curl; do
     command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
 docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
 zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
 
-# 1. Service user (uid/gid 2100, matches DOCKER_UID/DOCKER_GID in searxng.service)
+# A secrets file in THIS directory is always a mistake -- the documented way to
+# create one is a heredoc, and you have to be standing here to run this script,
+# so a mistyped path lands it in the repo. .gitignore covers it, but catching it
+# at the moment it is made beats relying on that.
+[ ! -e ./secrets.env ] || die "found ./secrets.env in the repo -- it belongs at $SECRETS. Move it: mv ./secrets.env $SECRETS"
+
+# 1. Service user (uid/gid 2100, matches DOCKER_UID/DOCKER_GID in searxng.service).
+#    The uid is deliberately outside every allocator's range (system 100-999 is
+#    filled by package postinsts in install order, human uids count up from
+#    1000, lxd subuids start at 100000) so the same number is free on any
+#    rebuilt machine -- file ownership on the dataset has to survive a restore.
+#
+#    The getent guard is load-bearing, not idempotency sugar: adduser's
+#    "already exists -> exit 0" path applies only to uids INSIDE the system
+#    range, so for this out-of-range uid a bare re-run of adduser would die
+#    ("exists, but is not a system user") and take this script with it.
 if ! getent passwd searxng >/dev/null; then
     adduser --system --group --uid "$SVC_UID" searxng
+fi
+# Existence isn't enough: a searxng user at any other uid/gid would make the
+# chown below converge the tree to an owner the container (hardcoded 2100 in
+# searxng.service) doesn't run as -- so the container could not read its own
+# settings.yml, would exit, and would crash-loop while this script printed
+# "converged" and exited 0.
+if [ "$(id -u searxng)" != "$SVC_UID" ] || [ "$(id -g searxng)" != "$SVC_UID" ]; then
+    die "user searxng is uid=$(id -u searxng) gid=$(id -g searxng), expected $SVC_UID:$SVC_UID (see searxng.service, compose.yml)"
 fi
 
 # 2. ZFS dataset backing the live config.
@@ -47,54 +79,203 @@ fi
 #    Note this dataset is NOT replicated -- replication is opt-in per dataset
 #    and searxng is deliberately not opted in. Everything here is either in
 #    this repo or regenerable, which is why the secret below is generated
-#    rather than restored.
+#    rather than restored. The one exception is the two values in secrets.env
+#    and deploy.env, which is why this script refuses to invent them.
 if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
     zfs create -p "$DATASET"
 fi
 
-# 3. Secret. Generated on first run: it only signs preference URLs and limiter
-#    tokens, so a new one costs nothing but invalidating saved preference
-#    links. Never regenerated once present, so repeat runs are stable.
+#    Existing is not the same as mounted, and the difference is dangerous: the
+#    `zfs list` above succeeds for an unmounted dataset, and everything below
+#    would then write into the BARE MOUNTPOINT on the parent filesystem. The
+#    generated secret would land there, settings.yml beside it, and the moment
+#    the dataset actually mounts, ZFS overlays the lot -- the old secret
+#    reappears, and an orphaned copy of secrets.env is left behind on the root
+#    filesystem where no backup and no audit will ever look for it.
+#
+#    findmnt answers both halves at once: $ROOT is a mountpoint, and what is
+#    mounted there is our dataset (not the parent fs, not something else). This
+#    runs BEFORE the secret is generated, because the secret is exactly what
+#    must not land in the wrong place.
+if [ "$(findmnt -no SOURCE "$ROOT" 2>/dev/null)" != "$DATASET" ]; then
+    die "$ROOT is not a mount of $DATASET -- refusing to write into a bare mountpoint (try: zfs mount $DATASET)"
+fi
+
+# 3. The bind sources. ONLY these subdirectories are mounted into the container;
+#    the dataset root that holds secrets.env is not.
+mkdir -p "$ROOT/config" "$ROOT/cache"
+
+#    The .keep file is load-bearing. Docker copies the image's content into a
+#    named volume when that volume is EMPTY, and that copy-up also stamps the
+#    image's ownership onto the volume root -- uid 977, the image's own searxng
+#    account, not the 2100 this deployment runs as. It happens at container
+#    start, i.e. AFTER the chown below, so the chown cannot win: the cache came
+#    up owned by 977 and unwritable by the running process, which SearXNG
+#    silently papers over by falling back to a temp directory inside the
+#    container's ephemeral layer -- so the favicon and engine-token caches were
+#    being destroyed on every image update, and the instance re-solicited tokens
+#    from the search engines immediately afterwards. A non-empty volume skips
+#    copy-up entirely, which makes the ownership stable instead of a race.
+touch "$ROOT/cache/.keep"
+
+#    A named volume freezes its bind device at CREATION and does not re-read it
+#    from compose.yml on later `up` runs. Changing `device:` therefore produces
+#    a warning, a prompt, and -- with no TTY, which is exactly how systemd
+#    invokes compose -- a silent no-op that still exits 0. Without this guard the
+#    single most important fix in this repo could appear to apply while the
+#    container went on mounting the old path.
+if docker volume inspect searxng_searxng >/dev/null 2>&1; then
+    die "the legacy 'searxng_searxng' volume still exists; it bind-mounts the DATASET ROOT into the container, which is the bug the config/ split exists to fix.
+  It holds no data (it is a bind), so remove it and re-run:
+    systemctl stop searxng.service && docker volume rm searxng_searxng && $PWD/install"
+fi
+for v in config cache; do
+    have=$(docker volume inspect "searxng_$v" --format '{{index .Options "device"}}' 2>/dev/null || true)
+    if [ -n "$have" ] && [ "$have" != "$ROOT/$v" ]; then
+        die "volume searxng_$v is bound to '$have', not '$ROOT/$v'. Docker never re-reads device: from compose.yml, so this cannot be fixed by editing it.
+    systemctl stop searxng.service && docker volume rm searxng_$v && $PWD/install"
+    fi
+done
+
+# 4. Secrets. Deliberately checked AFTER the dataset is confirmed mounted: ZFS
+#    mounts over a non-empty directory (overlay defaults to on), so a secrets
+#    file written into the mountpoint beforehand would be silently shadowed the
+#    moment it mounts -- present to the writer, invisible here.
+#
+#    secret_key is generated on first run: it signs preference URLs, Flask
+#    session cookies, the image-proxy URL HMAC, and the engine cache password,
+#    so a new one costs saved preference links, in-flight proxied image URLs and
+#    the engine cache -- all self-healing, none of it worth a manual step on
+#    every rebuild. Never regenerated once present, so repeat runs are stable.
+#    The base URL cannot be invented: it is this instance's own public identity.
 if [ ! -r "$SECRETS" ]; then
     (umask 077; { printf 'SEARXNG_SECRET_KEY=%s\n' "$(openssl rand -hex 32)"
                   printf 'SEARXNG_BASE_URL=\n'; } > "$SECRETS")
     echo "install: seeded $SECRETS with a generated secret key" >&2
 fi
-set -a
-# shellcheck source=/dev/null
-. "$SECRETS"
-set +a
-[ -n "${SEARXNG_SECRET_KEY:-}" ] || die "SEARXNG_SECRET_KEY is unset or empty in $SECRETS"
-# Cannot be generated: it is this instance's own public URL.
-[ -n "${SEARXNG_BASE_URL:-}" ] || die "SEARXNG_BASE_URL is unset or empty in $SECRETS -- set it to this instance's public URL, e.g. https://searxng.example.com/"
 
-# 4. Render config: template (this dir) + secret -> live mount.
-#    envsubst gets an explicit variable list so ONLY this placeholder is
-#    substituted; every other $-sequence in the upstream settings survives.
-#    Rendered to a temp file and moved into place so a failure here can never
-#    leave a truncated settings.yml behind. 0640 because it holds the key.
-#    /usr/bin/install is spelled out: this script is itself named `install`.
+# Parsed, never sourced. `. "$SECRETS"` would execute the file as root, and this
+# file lives in a directory that only recently stopped being writable by the
+# container -- the exact chain that made a compromised worker able to own the
+# host at the operator's next routine `sudo ./install`. Only these two keys are
+# accepted; anything else in the file is ignored rather than run.
+# Tolerates the shapes a hand-edit produces -- optional surrounding quotes and a
+# stray CR -- because sourcing used to absorb those silently and no longer does.
+# An unstripped quote here would render `secret_key: ""abc""`, which is not valid
+# YAML and would crash-loop the container.
+read_var() {
+    local v
+    v=$(grep -m1 -oP "^$2=\K.*" "$1" 2>/dev/null || true)
+    v=${v%$'\r'}
+    v=${v#\"}; v=${v%\"}
+    v=${v#\'}; v=${v%\'}
+    printf '%s' "$v"
+}
+SEARXNG_SECRET_KEY=$(read_var "$SECRETS" SEARXNG_SECRET_KEY)
+SEARXNG_BASE_URL=$(read_var "$SECRETS" SEARXNG_BASE_URL)
+export SEARXNG_SECRET_KEY SEARXNG_BASE_URL
+
+# 5. Non-secret deployment parameters. Seeded rather than demanded so a fresh
+#    machine shows an empty value instead of a missing file, but still refused
+#    below when empty -- publishing on every interface by accident is how this
+#    instance ended up reachable from the LAN with no auth and no rate limit.
+if [ ! -e "$DEPLOY_ENV" ]; then
+    cat > "$DEPLOY_ENV" <<'EOF'
+# Read by searxng.service and searxng-update.service, and passed to compose.
+# Not secret, but deployment-specific, so it is here and not in git.
+# Lives on the dataset; note the dataset is NOT replicated, so a rebuild
+# recreates this file rather than restoring it.
+
+# The single address the published port binds to. This instance has no auth and
+# no rate limiting, so this must be the interface the reverse proxy reaches and
+# nothing more. Compose falls back to 127.0.0.1 if this is unset.
+#
+# If this address comes from DHCP, reserve the lease. A changed address makes
+# compose fail to bind, which is loud and retried -- the right failure, but still
+# an outage.
+SEARXNG_BIND_ADDR=
+
+# Image tag. `latest` is the normal state. Pin a bad release by setting a
+# version here (e.g. 2026.7.1-abc1234), then restart; delete the line to un-pin.
+SEARXNG_TAG=latest
+EOF
+    echo "install: wrote template $DEPLOY_ENV" >&2
+fi
+SEARXNG_BIND_ADDR=$(read_var "$DEPLOY_ENV" SEARXNG_BIND_ADDR)
+
+missing=()
+[ -n "$SEARXNG_SECRET_KEY" ] || missing+=("SEARXNG_SECRET_KEY in $SECRETS (should have been generated -- check the file)")
+[ -n "$SEARXNG_BASE_URL" ]   || missing+=("SEARXNG_BASE_URL in $SECRETS -- this instance's own public URL, e.g. https://searxng.example.com/")
+[ -n "$SEARXNG_BIND_ADDR" ]  || missing+=("SEARXNG_BIND_ADDR in $DEPLOY_ENV -- the one address to publish on, e.g. the LAN IP your reverse proxy connects to")
+if [ ${#missing[@]} -gt 0 ]; then
+    { echo "install: cannot converge, these deployment values are unset:"; printf '  - %s\n' "${missing[@]}"
+      echo; echo "  Set them and re-run. Both files already exist and are on the dataset;"
+      echo "  neither can be guessed, which is why they are not in the repo."; } >&2
+    exit 1
+fi
+
+# 6. Render config: template (this dir) + values (the dataset) -> live mount.
+#    envsubst gets an explicit variable list so ONLY these placeholders are
+#    substituted; every other $-sequence in the settings survives.
+#
+#    Staged at the DATASET ROOT, never inside config/. config/ is bind-mounted
+#    as the container's /etc/searxng and is owned by uid 2100, so staging there
+#    handed a compromised container a lever on root: a `>` redirect follows
+#    symlinks, so a pre-planted temp name would make root write this file
+#    wherever the link pointed, and swapping the link between render and copy
+#    would splice an arbitrary root-readable file into a container-readable
+#    settings.yml. (fs.protected_symlinks does not save you here: it only
+#    engages for sticky world-writable directories, and returns early when the
+#    link's owner matches the directory's owner -- both uid 2100.) The dataset
+#    root is not bind-mounted, so the container cannot see it, and mktemp
+#    creates the file O_EXCL under a random name at 0600, so the rendered
+#    secret_key is never briefly world-readable either.
+#
+#    Same filesystem as config/, so the final mv is a rename(2): atomic, and it
+#    replaces a planted destination symlink rather than following it. The old
+#    code claimed this ("moved into place") while actually copying via
+#    /usr/bin/install, which is not atomic.
+render=$(mktemp "$ROOT/.settings.yml.XXXXXX")
+limiter_render=$(mktemp "$ROOT/.limiter.toml.XXXXXX")
+trap 'rm -f "$render" "$limiter_render"' EXIT
 # shellcheck disable=SC2016  # the single quotes are envsubst's variable list, not an expansion
-envsubst '${SEARXNG_SECRET_KEY} ${SEARXNG_BASE_URL}' < settings.yml.tmpl > "$ROOT/.settings.yml.new"
-/usr/bin/install -o searxng -g searxng -m 0640 "$ROOT/.settings.yml.new" "$ROOT/settings.yml"
-rm -f "$ROOT/.settings.yml.new"
-/usr/bin/install -o searxng -g searxng -m 0644 limiter.toml "$ROOT/limiter.toml"
+envsubst '${SEARXNG_SECRET_KEY} ${SEARXNG_BASE_URL}' < settings.yml.tmpl > "$render"
+chown searxng:searxng "$render"
+chmod 0640 "$render"          # 0640: it holds the secret_key
+mv -f "$render" "$ROOT/config/settings.yml"
 
-# 5. Ownership (belt-and-suspenders; the container runs as uid 2100), then
-#    re-assert root-only on the secret the sweep just touched.
+cat limiter.toml > "$limiter_render"
+chown searxng:searxng "$limiter_render"
+chmod 0644 "$limiter_render"
+mv -f "$limiter_render" "$ROOT/config/limiter.toml"
+
+# 7. Sweep stale renders. These accumulated at the dataset root from earlier
+#    hand-editing (settings.yml.new, three dated .bak files); each is a full
+#    rendered config containing secret_key, and the recursive chown below was
+#    re-granting them to the container's uid on every run. They are not rollback
+#    targets -- the repo is.
+find "$ROOT" -maxdepth 1 -type f \
+    \( -name 'settings.yml*' -o -name 'limiter.toml*' -o -name '.settings.yml.*' -o -name '.limiter.toml.*' \) \
+    -delete
+
+# 8. Ownership (belt-and-suspenders; the container runs as uid 2100), then
+#    re-assert root-only on the credential file the sweep just touched. It sits
+#    at the dataset root, which compose does not bind-mount (only config/ and
+#    cache/ are), so the container never sees it.
 chown -R searxng:searxng "$ROOT"
 chown root:root "$SECRETS"
 chmod 0600 "$SECRETS"
+chmod 0644 "$DEPLOY_ENV"
 
-# 6. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
+# 9. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
 #    pulls on start (updates come from searxng-update.timer), so the override
 #    is not just unneeded but would re-add a pull. Safe if already absent.
 rm -f /etc/systemd/system/searxng.service.d/pull-not-on-boot.conf
 rmdir --ignore-fail-on-non-empty /etc/systemd/system/searxng.service.d 2>/dev/null || true
 
-# 7. Register units (idempotent). `enable` installs the /opt symlink for the
-#    main service and the timer; the oneshot update service has no [Install]
-#    section, so it is `link`ed instead so the timer can resolve it by name.
+# 10. Register units (idempotent). `enable` installs the /opt symlink for the
+#     main service and the timer; the oneshot update service has no [Install]
+#     section, so it is `link`ed instead so the timer can resolve it by name.
 systemctl enable "$PWD/searxng.service"
 if ! systemctl cat searxng-update.service >/dev/null 2>&1; then
     systemctl link "$PWD/searxng-update.service"
@@ -102,9 +283,55 @@ fi
 systemctl enable "$PWD/searxng-update.timer"
 systemctl daemon-reload
 
-# 8. Apply: (re)start the service (picks up any staged image + config) and
-#    activate the update timer now (it was enabled above).
-systemctl restart searxng.service
+# 11. Apply: (re)start the service (picks up any staged image + config) and
+#     activate the update timer now (it was enabled above).
+#
+#     A failed restart is reported rather than left to `set -e`, because the unit
+#     retries on its own: ExecStartPre failures put it in a 30s auto-restart loop,
+#     so "restart returned 1" means "not up YET", not "dead".
+systemctl restart searxng.service ||
+    die "searxng.service did not start. It will keep retrying every 30s; the reason is in: journalctl -p err -u searxng -n 20"
 systemctl start searxng-update.timer
 
-echo "install: searxng converged."
+# 12. Smoke test. Until now "converged" meant "systemd accepted the job", which
+#     is not the same as "searxng is answering" -- a bad value in
+#     settings.yml.tmpl renders fine (envsubst does not parse YAML), starts
+#     fine, and then crash-loops inside the container. Editing the template and
+#     re-running is the most common operation in this repo, so that is exactly
+#     the failure this must catch. /healthz needs no auth.
+health_url="http://${SEARXNG_BIND_ADDR}:8080/healthz"
+for _ in $(seq 60); do
+    if curl -fsS --max-time 2 -o /dev/null "$health_url" 2>/dev/null; then
+        ok=1; break
+    fi
+    sleep 1
+done
+[ "${ok:-}" = 1 ] || die "config applied and the unit started, but searxng never answered $health_url within 60s.
+  The container is probably crash-looping on a bad settings.yml value. Check:
+    docker logs --tail 20 searxng
+    journalctl -u searxng -n 30"
+
+# 13. Answering is not the same as answering with the engines you configured.
+#     A name in settings.yml.tmpl that the image has no module for is OUR bug
+#     and it is silent: the engine simply does not exist, results are quietly
+#     thinner, and the healthcheck stays green. That is what happened to the
+#     reddit and presearch entries, which logged a traceback on every start for
+#     months. Fatal, because re-running after removing the name is the fix.
+if bad=$(docker logs searxng 2>&1 | grep -oP 'Cannot load engine "\K[^"]+' | sort -u) && [ -n "$bad" ]; then
+    die "the image has no module for these engines named in settings.yml.tmpl:
+$(printf '%s\n' "$bad" | sed 's/^/    /')
+  Remove them from the keep_only list and re-run."
+fi
+#     An engine that failed to INITIALISE is a different thing: usually a
+#     transient 403 or timeout from the engine's own site at startup. It is not
+#     a config error and must not fail a deploy -- but it is worth saying out
+#     loud, because initialisation happens once per worker and a single bad
+#     moment at boot leaves that engine dead, and advertised, until the next
+#     restart.
+if warn=$(docker logs searxng 2>&1 | grep -oP "\(PID [0-9]+\) \K[^:]+(?=: can't register engines processor)" | sort -u) && [ -n "$warn" ]; then
+    echo "install: WARNING -- these engines did not initialise and will stay dead until the next restart:" >&2
+    printf '%s\n' "$warn" | sed 's/^/    /' >&2
+    echo "  Usually a transient block from the engine's own site. Re-check with: docker logs searxng | grep register" >&2
+fi
+
+echo "install: searxng converged and answering on $health_url"

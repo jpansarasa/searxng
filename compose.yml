@@ -3,34 +3,97 @@ name: searxng
 services:
   searxng:
     container_name: searxng
-    image: docker.io/searxng/searxng:latest
-    restart: unless-stopped
-    user: "${DOCKER_UID}:${DOCKER_GID}"
+    # Tag comes from the environment so a bad :latest can be pinned out without
+    # editing this file. The units set SEARXNG_TAG=latest and let
+    # /tank/searxng/deploy.env override it; the default here covers by-hand runs.
+    image: docker.io/searxng/searxng:${SEARXNG_TAG:-latest}
+    # Deliberately NO restart policy: systemd is the only supervisor.
+    # With one here, dockerd restarts the container behind searxng.service's back
+    # -- the attached `compose up` never exits, so a crash-loop leaves the unit
+    # green, Restart=always dead code, and the outage invisible. Without one, a
+    # container exit ends `compose up`, and systemd restarts it in the journal
+    # where you can see it. (Learned on this host with ntfy: nine container
+    # restarts on a bad render while systemd logged no state change at all.)
+    #
+    # The defaults matter: without them a by-hand `docker compose up` renders
+    # `user: ":"`, which Docker resolves to ROOT -- and root can read the
+    # root-only secrets.env by ownership alone.
+    user: "${DOCKER_UID:-2100}:${DOCKER_GID:-2100}"
+    # Bind to one address, not every interface. This instance has no auth and
+    # `limiter: false`, and it is reached by an HAProxy that lives on another
+    # host, so publishing on 0.0.0.0 put an open search proxy on the LAN and on
+    # every libvirt/docker bridge. Docker's published ports are DNAT'd ahead of
+    # the INPUT chain, so a host firewall would not have covered this without an
+    # explicit DOCKER-USER rule. The address is deployment-specific and so lives
+    # in /tank/searxng/deploy.env, not here; the fallback is fail-closed.
     ports:
-      - 8080:8080
+      - "${SEARXNG_BIND_ADDR:-127.0.0.1}:8080:8080"
     volumes:
-      - searxng:/etc/searxng:rw
+      - config:/etc/searxng:rw
+      - cache:/var/cache/searxng:rw
     environment:
       - TZ=America/New_York
+      # The entrypoint chowns its config tree when it does not already belong to
+      # the image's own searxng account (uid 977) AND it is running as root.
+      # This deployment owns that tree as 2100 on purpose, so the only way that
+      # chown can fire is the by-hand-as-root mistake above -- where it would
+      # rewrite the dataset to uid 977 and leave the next normal start unable to
+      # read its own config. Refuse it rather than rely on never making it.
+      - FORCE_OWNERSHIP=false
     cap_drop:
       - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-      - DAC_OVERRIDE
+    # No cap_add. The upstream-recommended CHOWN/SETGID/SETUID/DAC_OVERRIDE set
+    # is inert under `user: 2100` -- a non-root euid with no file capabilities
+    # never raises anything into the effective set, and CapEff reads all zeros
+    # either way. Requesting them bought nothing and left a trap: DAC_OVERRIDE
+    # is precisely the capability that bypasses file permission checks, so an
+    # image that ever shipped a setuid-root binary could fill the effective set
+    # from the bounding set. no-new-privileges closes that path directly.
+    security_opt:
+      - no-new-privileges:true
+    # A metasearch engine fans out to ~87 upstream engines with pool_connections
+    # at 100. Unbounded, a leak or a redirect-looping engine competes for the
+    # whole box against the media stack and against ntfy, which is this host's
+    # own alert channel -- so the thing that tells you something is wrong is the
+    # thing that dies. Idles around 215 MiB.
+    cpus: '2.0'
+    mem_limit: 2G
+    mem_reservation: 256M
+    # json-file never rotates on its own. ~11 KB/hour of engine tracebacks is
+    # harmless until one engine starts failing on every query.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider --header='X-Forwarded-For: 127.0.0.1' http://0.0.0.0:8080 || exit 1"]
+      # /healthz, not the index page with a spoofed X-Forwarded-For. The header
+      # compensated for nothing (the check already originates from a trusted
+      # address, and a plain request to the index returns 200), and spoofing a
+      # forwarded-for in a healthcheck is a habit worth not having.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz || exit 1"]
       interval: 1m30s
       timeout: 5s
       start_period: 30s
       start_interval: 5s
       retries: 3
 
+# Only the config/ and cache/ SUBDIRECTORIES are bind-mounted, never the dataset
+# root. secrets.env sits at the root, so this is what keeps it outside the
+# container's filesystem view entirely -- and, just as importantly, keeps the
+# directory that `install` renders into out of the container's reach. When the
+# root was mounted, the container's own uid OWNED that directory, which is all
+# it takes to unlink and replace a 0600 root-owned file that root then sources.
 volumes:
-  searxng:
+  config:
     driver: local
     driver_opts:
       type: none
-      device: /tank/searxng
+      device: /tank/searxng/config
+      o: bind
+  cache:
+    driver: local
+    driver_opts:
+      type: none
+      device: /tank/searxng/cache
       o: bind

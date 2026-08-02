@@ -1,21 +1,93 @@
 [Unit]
 Description=SearXNG container
-Requires=docker.service
+
+# Wants=, NOT Requires=. Both gate on docker, but they fail in opposite ways.
+# A failed Requires= dependency aborts the START JOB: the unit never enters
+# start, so Restart= is never armed, and it sits at inactive/dead with
+# Result=success -- absent from `systemctl --failed`, and NOT revived when
+# docker is repaired, because nothing re-enqueues a start job. That matters
+# here: docker.service is StartLimitBurst=3/StartLimitIntervalSec=60, so a boot
+# where containerd or the firewall races dockerd makes docker give up for good
+# in ~4s, and this unit would follow it into a silent grave.
+# With Wants=, a dead dockerd instead fails ExecStart, which DOES arm
+# Restart=always -- so it retries every 30s and recovers on its own once docker
+# is back. Same "fail, don't skip" rule as the guards below.
+Wants=docker.service
 After=docker.service
+
+# Ordering only, and deliberately no RequiresMountsFor=/tank/searxng. On this
+# host tank-searxng.mount is synthesized from /proc/self/mountinfo with no
+# fragment, so RequiresMountsFor yields ordering and no requirement -- but that
+# is an accident of configuration: enabling zfs-mount-generator gives the mount
+# unit a fragment, at which point it silently becomes a Requires= edge and
+# inherits the exact start-job wedge described above. The dataset is gated by
+# ExecStartPre instead, which retries. After= can never wedge a unit.
+After=zfs-mount.service
+
+# A Condition is right HERE and wrong for the dataset. /opt is on the root
+# filesystem, so this path cannot arrive late; its absence means the install is
+# gone, which is a human action, not a transient fault. Skip-and-stay-quiet is
+# the correct semantic for that. It is the wrong semantic for the dataset, which
+# is the whole lesson: Condition* answers "should I bother?", not "am I ready?".
+# The dataset used to be gated by ConditionPathIsDirectory=/tank/searxng, which
+# is worse than useless -- a BARE MOUNTPOINT satisfies it, so it passed in
+# exactly the fail-open case it looked like it was guarding.
 ConditionPathExists=/opt/searxng/compose.yml
-ConditionPathIsDirectory=/tank/searxng
+
+# Never stop retrying. At RestartSec=30 the default limit (5 starts / 10s) is
+# already unreachable, so this makes the guarantee structural instead of
+# arithmetic and survives someone lowering RestartSec later while debugging.
+StartLimitIntervalSec=0
 
 [Service]
 Restart=always
 RestartSec=30
 Environment=DOCKER_UID=2100 DOCKER_GID=2100
 
-# No image pull here: boot/start must be fast and network-order-independent.
-# Updates are fetched out-of-band by searxng-update.timer and applied on the
-# next (re)start. `up` still auto-pulls if the image is entirely missing.
-ExecStart=-/usr/bin/docker compose --file /opt/searxng/compose.yml --project-name searxng up --remove-orphans
+# Image tag. latest is the default and the normal state; a bad release is pinned
+# out by setting SEARXNG_TAG in /tank/searxng/deploy.env, which systemd applies
+# AFTER Environment= and therefore wins. The same file carries
+# SEARXNG_BIND_ADDR, which compose needs at start time. The leading `-` makes
+# the file optional; compose's own fallback for the bind address is 127.0.0.1,
+# so a missing file fails closed rather than republishing on 0.0.0.0.
+Environment=SEARXNG_TAG=latest
+EnvironmentFile=-/tank/searxng/deploy.env
 
-ExecStop=-/usr/bin/docker compose --file /opt/searxng/compose.yml --project-name searxng down --timeout 10
+# The dataset guard. This replaces ConditionPathIsDirectory=/tank/searxng, which
+# SKIPPED instead of failing: the unit never started, Restart= was never armed,
+# nothing re-evaluated it, and a late pool import left searxng silently dead
+# with one journal line as the only trace. A failing ExecStartPre is a real
+# start failure, so Restart=always retries it every 30s forever, re-running this
+# check each cycle; a `zfs mount tank/searxng` therefore recovers the service
+# unattended within one RestartSec.
+#
+# --type/--source are load-bearing, not decoration: a bare mountpoint test also
+# passes when something ELSE is mounted there, and reads only
+# /proc/self/mountinfo, so it cannot block on a faulted pool.
+ExecStartPre=/bin/sh -c '/usr/bin/findmnt --type zfs --source tank/searxng --mountpoint /tank/searxng --noheadings --output SOURCE,TARGET || { echo "<3>searxng: tank/searxng is NOT mounted at /tank/searxng -- refusing to start, because the compose bind sources would be created in a bare mountpoint and the container would come up on built-in defaults with a throwaway secret_key. Retrying every 30s."; exit 1; }'
+
+# Mounted but empty is the same hazard: without settings.yml the image's
+# entrypoint silently copies its own template into place and rewrites
+# ultrasecretkey with a random value, so the instance comes up looking healthy
+# on a configuration nobody chose. Unlike the check above this one stat()s the
+# dataset, which blocks indefinitely on a faulted pool (tank is failmode=wait),
+# so it is bounded -- an unkillable D-state process would otherwise leak into
+# the cgroup on every retry.
+ExecStartPre=/usr/bin/timeout 10 /bin/sh -c 'test -s /tank/searxng/config/settings.yml || { echo "<3>searxng: /tank/searxng/config/settings.yml is missing or empty -- refusing to start, because the entrypoint would generate a default config with a throwaway secret. Run /opt/searxng/install. Retrying every 30s."; exit 1; }'
+
+# No `-` prefix on either exec line. It would record a real compose failure as
+# Result=success: the journal logs a clean deactivation instead of "Failed with
+# result 'exit-code'", nothing keyed on PRIORITY=3 fires, and if Restart= is
+# ever softened to on-failure it becomes a permanent silent stop. On ExecStop it
+# was worse -- a `down` that fails because /opt/searxng is gone left the
+# container running under a unit that believed it had stopped it.
+#
+# No image pull here either: boot/start must be fast and network-order
+# independent. Updates are fetched out-of-band by searxng-update.timer and
+# applied on the next (re)start. `up` still auto-pulls if the image is missing.
+ExecStart=/usr/bin/docker compose --file /opt/searxng/compose.yml --project-name searxng up --remove-orphans
+
+ExecStop=/usr/bin/docker compose --file /opt/searxng/compose.yml --project-name searxng down --timeout 10
 
 [Install]
 WantedBy=multi-user.target

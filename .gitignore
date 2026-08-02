@@ -1,9 +1,15 @@
-# Rendered output, not source. The live copy lives at /tank/searxng/settings.yml
-# and contains the secret_key. Source of truth is settings.yml.tmpl.
+# Rendered output, not source. The live copy lives at
+# /tank/searxng/config/settings.yml and contains the secret_key.
+# Source of truth is settings.yml.tmpl.
 settings.yml
 
-# Orphaned landing page: not deployed by install, compose, or the unit.
-index.html
+# Credential / deployment-parameter files. These belong on /tank/searxng and are
+# never tracked here. The rule exists because the documented way to create one is
+# a heredoc, and you must be sitting in /opt/searxng to run `install` -- so a
+# mistyped path drops secrets.env right next to this file, untracked but visible
+# to the next `git add -A`. (`install` also refuses to run if it finds one here.)
+*.env
+secrets.env
 
 # Local cruft from in-place editing on the host.
 *.bak

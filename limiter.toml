@@ -1,5 +1,25 @@
-# This configuration file updates the default configuration file
+# Bot-detection / rate-limit config.
 # See https://docs.searxng.org/admin/searx.limiter
+#
+# CURRENTLY INERT, on purpose. SearXNG only initialises the botdetection
+# subsystem when `limiter: true`, and settings.yml.tmpl sets it false, so
+# nothing here is read at runtime. It is deployed anyway so that enabling the
+# limiter is a one-line change with the policy already written, and kept in the
+# repo because none of it is deployment-specific.
+#
+# Enabling it needs THREE things together, or it is worse than useless:
+#   1. `limiter: true` in settings.yml.tmpl.
+#   2. A Valkey backend (`valkey.url`), which this deployment deliberately does
+#      not run. Without it the limiter cannot keep counters and will not work.
+#   3. `botdetection.trusted_proxies` set to the reverse proxy's address and
+#      nothing else. Upstream validates the X-Forwarded-For CHAIN but honours
+#      X-Real-IP unconditionally, so without this any client that can reach the
+#      port simply sends `X-Real-IP: 10.0.0.1` and lands in the pass list below.
+#
+# Note the pass list is what makes this a poor substitute for network scoping:
+# it trusts every RFC1918 range, which is precisely the set of addresses a
+# LAN-side attacker already holds. Access control here is done by binding the
+# published port to one interface (SEARXNG_BIND_ADDR), not by this file.
 
 [botdetection.ip_limit]
 # activate link_token method in the ip_limit method
@@ -7,9 +27,12 @@ link_token = false
 
 [botdetection.ip_lists]
 block_ip = []
+# Deliberately the generic RFC1918/loopback/link-local constants rather than
+# this network's actual subnet. These are universal documentation values and
+# disclose nothing; narrowing them to the real range is what would leak.
 pass_ip = [
     "10.0.0.0/8",      # RFC 1918 - Class A private network
-    "172.16.0.0/12",   # RFC 1918 - Class B private network  
+    "172.16.0.0/12",   # RFC 1918 - Class B private network
     "192.168.0.0/16",  # RFC 1918 - Class C private network
     "127.0.0.0/8",     # Loopback addresses
     "169.254.0.0/16",  # Link-local addresses

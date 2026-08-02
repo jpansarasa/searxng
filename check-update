@@ -2,11 +2,11 @@
 #
 # SearXNG image update check (fetch + notify, does NOT apply).
 #
-# Pulls docker.io/searxng/searxng:latest and compares it to the image the
-# running container is actually using. If they differ, an update is "staged":
-# it is flagged (systemd journal + a marker file) but the container is left
-# running the old image. Apply a staged update with:
-#     sudo systemctl restart searxng.service   # (reconcile settings.yml first)
+# Pulls the configured tag and compares it to the image the running container is
+# actually using. If they differ, an update is "staged": it is flagged (systemd
+# journal + a marker file) but the container is left running the old image.
+# Apply a staged update with:
+#     sudo systemctl restart searxng.service
 # A reboot also applies it (the service's `up` uses the already-pulled image).
 #
 # Run by searxng-update.timer; safe to run by hand.
@@ -15,29 +15,65 @@ set -euo pipefail
 
 export DOCKER_UID="${DOCKER_UID:-2100}" DOCKER_GID="${DOCKER_GID:-2100}"
 
-IMAGE=docker.io/searxng/searxng:latest
+# Track whatever tag searxng.service would actually start, or this reports on an
+# image a restart would never run. The units pass SEARXNG_TAG in; a by-hand run
+# gets it from the same file they use, then falls back to the same default.
+# (`if` rather than `[ -r ] && .` -- the latter returns 1 when absent and would
+# trip set -e.)
+if [ -r /tank/searxng/deploy.env ]; then
+    # shellcheck source=/dev/null
+    . /tank/searxng/deploy.env
+fi
+export SEARXNG_TAG="${SEARXNG_TAG:-latest}"
+
+IMAGE="docker.io/searxng/searxng:${SEARXNG_TAG}"
 MARKER=/run/searxng-update-available
 COMPOSE=(/usr/bin/docker compose --file /opt/searxng/compose.yml --project-name searxng)
 # Canonical location is ntfy's dataset: the token is an ntfy credential, it is
-# backed up there, and keeping one copy avoids drift between services.
-NOTIFY_ENV=/tank/ntfy/notify.env
+# backed up there, and keeping one copy avoids drift between services. The path
+# is overridable so a host without ntfy needs no edit to this tracked file.
+NOTIFY_ENV="${NOTIFY_ENV:-/tank/ntfy/notify.env}"
 
 # Best-effort ntfy push; never fails the check. Args: title, tags, body.
-# Silently no-ops if the (root-only) notify env / token is absent.
-notify() {
-    [ -r "$NOTIFY_ENV" ] || return 0
-    # shellcheck source=/dev/null
-    . "$NOTIFY_ENV"
-    [ -n "${NTFY_TOKEN:-}" ] || return 0
-    curl -fsS --max-time 10 \
-        -H "Authorization: Bearer ${NTFY_TOKEN}" \
-        -H "Title: ${1}" \
-        -H "Tags: ${2}" \
-        -d "${3}" \
-        "${NTFY_URL:-http://localhost:8123}/${NTFY_TOPIC:-updates}" >/dev/null 2>&1 || true
-}
+#
+# Runs in a SUBSHELL -- note the ( ) rather than { } -- so nothing it reads can
+# leak into this script's environment. It also parses the file instead of
+# sourcing it: `.` on a root-owned file from ANOTHER service's dataset is
+# arbitrary code execution as root, and the trust argument is weakest exactly on
+# the restore path, where a ZFS receive from a compromised backup host would
+# otherwise own this host at the next timer elapse.
+#
+# Every skip and every failure says so on stderr, which the timer captures in
+# the journal. Silence used to mean "no updates" and "the token was revoked
+# eleven months ago" indistinguishably, which is a poor property for the channel
+# whose entire job is telling you about updates.
+notify() (
+    if [ ! -r "$NOTIFY_ENV" ]; then
+        echo "check-update: no push: $NOTIFY_ENV is absent or unreadable" >&2
+        return 0
+    fi
+    local url topic token
+    url=$(grep -m1 -oP '^NTFY_URL=\K.*'   "$NOTIFY_ENV" 2>/dev/null || true)
+    topic=$(grep -m1 -oP '^NTFY_TOPIC=\K.*' "$NOTIFY_ENV" 2>/dev/null || true)
+    token=$(grep -m1 -oP '^NTFY_TOKEN=\K.*' "$NOTIFY_ENV" 2>/dev/null || true)
+    url="${url:-http://localhost:8123}"
+    topic="${topic:-updates}"
+    if [ -z "$token" ]; then
+        echo "check-update: no push: NTFY_TOKEN is empty in $NOTIFY_ENV" >&2
+        return 0
+    fi
+    # The token goes in on stdin, not argv: /proc is mounted without hidepid, so
+    # a command line would expose it to every local user for the duration.
+    if ! printf 'Authorization: Bearer %s\n' "$token" |
+        curl -fsS --max-time 10 -H @- \
+            -H "Title: ${1}" -H "Tags: ${2}" -d "${3}" \
+            -o /dev/null "${url}/${topic}"; then
+        echo "check-update: ntfy push FAILED (token revoked? topic? url=$url)" >&2
+    fi
+    return 0
+)
 
-# Fetch the latest tag. This updates the local :latest pointer only; it does
+# Fetch the configured tag. This updates the local tag pointer only; it does
 # NOT touch the running container.
 "${COMPOSE[@]}" pull --quiet
 
@@ -59,15 +95,31 @@ fi
 if [ "$running" != "$latest" ]; then
     {
         echo "SearXNG update staged (not applied)."
+        echo "tag:     $SEARXNG_TAG"
         echo "running: $running"
         echo "latest:  $latest"
         echo "checked: $(date -Is)"
-        echo "Apply:   reconcile settings.yml, then: sudo systemctl restart searxng.service"
+        echo "Apply:   sudo systemctl restart searxng.service"
     } | tee "$MARKER" >&2
     notify "SearXNG update available" "package,searxng" \
-        "New :latest image staged. Apply: reconcile settings.yml, then sudo systemctl restart searxng.service"
+        "New $SEARXNG_TAG image staged. Apply: sudo systemctl restart searxng.service"
     exit 0
 fi
 
 rm -f "$MARKER"
-echo "SearXNG already running the latest image ($latest)."
+echo "SearXNG already running the current $SEARXNG_TAG image ($latest)."
+
+# Pinned: the running image matches the pin, so nothing is staged and nothing
+# above fired. A pin is meant to be temporary, though, so report when upstream
+# moves -- that is the signal the bad release was superseded and the pin can go.
+# Deliberately NOT written to $MARKER: a restart applies none of this.
+if [ "$SEARXNG_TAG" != latest ]; then
+    docker pull --quiet docker.io/searxng/searxng:latest >/dev/null 2>&1 || true
+    upstream=$(docker image inspect --format '{{.Id}}' docker.io/searxng/searxng:latest 2>/dev/null || true)
+    if [ -n "$upstream" ] && [ "$upstream" != "$running" ]; then
+        echo "note: pinned to $SEARXNG_TAG; upstream :latest has moved ($upstream)."
+        echo "      un-pin by removing SEARXNG_TAG from /tank/searxng/deploy.env, then restart."
+        notify "SearXNG pin can likely be retired" "pushpin,searxng" \
+            "Pinned to $SEARXNG_TAG; upstream :latest has moved. Un-pin: remove SEARXNG_TAG from /tank/searxng/deploy.env, then sudo systemctl restart searxng.service"
+    fi
+fi

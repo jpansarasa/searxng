@@ -1,6 +1,13 @@
 [Unit]
-Description=SearXNG image update check (fetch :latest, notify if newer than running)
+Description=SearXNG image update check (fetch the configured tag, notify if newer than running)
 Documentation=file:/opt/searxng/check-update
+
+# Requires= here, deliberately, even though the same directive is a defect in
+# searxng.service. The wedge in the long-running unit exists because nothing
+# re-enqueues a start job after a dependency-aborted start. A timer enqueues a
+# brand-new start job at every elapse, which re-evaluates the dependency and
+# pulls docker up if it is merely stopped. Worst case is one skipped daily
+# check, retried tomorrow.
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
@@ -9,4 +16,8 @@ ConditionPathExists=/opt/searxng/compose.yml
 [Service]
 Type=oneshot
 Environment=DOCKER_UID=2100 DOCKER_GID=2100
+# Must agree with searxng.service, or the checker reports on a different image
+# than the one a restart would actually run. See that unit for the pin story.
+Environment=SEARXNG_TAG=latest
+EnvironmentFile=-/tank/searxng/deploy.env
 ExecStart=/opt/searxng/check-update
