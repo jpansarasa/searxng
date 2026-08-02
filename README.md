@@ -98,15 +98,25 @@ HMAC, and the engine cache password.)
 
 ## Backups
 
-**`tank/searxng` is not replicated, deliberately.** Replication to the backup
-host is opt-in per dataset (`com.sun:auto-snapshot:*` is false on the pool), and
-searxng is not opted in — verified: every `com.sun:auto-snapshot:<label>`
-property on the dataset is false and it has no snapshots. That is about
-*snapshots*, not about durability: the pool still travels with the drives, which
-is why configuration belongs on it. What snapshots would add here is
-point-in-time rollback, and nothing on this dataset needs it — everything is
-either in this repo (`settings.yml`, `limiter.toml`), regenerable (the secret,
-the engine caches), or two lines of typing.
+`tank/searxng` is opted into `zfs-auto-snapshot` at the monthly label
+(`com.sun:auto-snapshot:monthly=true`, set locally on the dataset), and the
+snapshots are picked up by the next sync to the backup host. `install` sets that
+property and takes a first snapshot when it creates the dataset from scratch, so
+a rebuild is protected immediately rather than at whenever-you-remember.
+
+It does that **only on creation**, deliberately: on a restore the property
+arrives with the received dataset, and a dataset opted out on purpose must not
+be silently opted back in by a later run.
+
+Note what a stale snapshot actually costs here, which is very little: the engine
+caches are regenerable, `settings.yml` and `limiter.toml` are rendered from this
+repo, and the secret is generated. The exposure is a hand edit to `secrets.env`
+or `deploy.env` made since the last snapshot — the two values you supply.
+Snapshot by hand after changing one of those if you care:
+
+```bash
+sudo zfs-auto-snapshot --label=monthly --keep=12 tank/searxng
+```
 
 `check-update` pushes an ntfy notification when an update is staged. It reads
 the token from `/tank/ntfy/notify.env` — ntfy's dataset, since that is an ntfy

@@ -98,13 +98,19 @@ fi
 
 # 2. ZFS dataset backing the live config.
 #
-#    Note this dataset is NOT replicated -- replication is opt-in per dataset
-#    and searxng is deliberately not opted in. Everything here is either in
-#    this repo or regenerable, which is why the secret below is generated
-#    rather than restored. The one exception is the two values in secrets.env
-#    and deploy.env, which is why this script refuses to invent them.
+#    A dataset created from scratch here is opted into zfs-auto-snapshot and
+#    given a first snapshot, so snapshot-based backup tooling has something to
+#    work from immediately and the next sync picks it up.
+#
+#    This runs ONLY on creation, deliberately. On a restore the property arrives
+#    with the received dataset, and if the dataset is ever opted out on purpose,
+#    a later install must not silently opt it back in.
 if ! zfs list -H -o name "$DATASET" >/dev/null 2>&1; then
     zfs create -p "$DATASET"
+    zfs set com.sun:auto-snapshot:monthly=true "$DATASET"
+    if command -v zfs-auto-snapshot >/dev/null; then
+        zfs-auto-snapshot --label=monthly --keep=12 "$DATASET"
+    fi
 fi
 
 #    Existing is not the same as mounted, and the difference is dangerous: the
