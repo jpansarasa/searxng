@@ -19,5 +19,5 @@ Environment=DOCKER_UID=2100 DOCKER_GID=2100
 # Must agree with searxng.service, or the checker reports on a different image
 # than the one a restart would actually run. See that unit for the pin story.
 Environment=SEARXNG_TAG=latest
-EnvironmentFile=-/tank/searxng/deploy.env
+EnvironmentFile=-/etc/searxng/deploy.env
 ExecStart=/opt/searxng/check-update

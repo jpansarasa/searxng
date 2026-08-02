@@ -45,13 +45,13 @@ RestartSec=30
 Environment=DOCKER_UID=2100 DOCKER_GID=2100
 
 # Image tag. latest is the default and the normal state; a bad release is pinned
-# out by setting SEARXNG_TAG in /tank/searxng/deploy.env, which systemd applies
+# out by setting SEARXNG_TAG in /etc/searxng/deploy.env, which systemd applies
 # AFTER Environment= and therefore wins. The same file carries
 # SEARXNG_BIND_ADDR, which compose needs at start time. The leading `-` makes
 # the file optional; compose's own fallback for the bind address is 127.0.0.1,
 # so a missing file fails closed rather than republishing on 0.0.0.0.
 Environment=SEARXNG_TAG=latest
-EnvironmentFile=-/tank/searxng/deploy.env
+EnvironmentFile=-/etc/searxng/deploy.env
 
 # The dataset guard. This replaces ConditionPathIsDirectory=/tank/searxng, which
 # SKIPPED instead of failing: the unit never started, Restart= was never armed,
@@ -62,9 +62,15 @@ EnvironmentFile=-/tank/searxng/deploy.env
 # unattended within one RestartSec.
 #
 # --type/--source are load-bearing, not decoration: a bare mountpoint test also
-# passes when something ELSE is mounted there, and reads only
-# /proc/self/mountinfo, so it cannot block on a faulted pool.
-ExecStartPre=/bin/sh -c '/usr/bin/findmnt --type zfs --source tank/searxng --mountpoint /tank/searxng --noheadings --output SOURCE,TARGET || { echo "<3>searxng: tank/searxng is NOT mounted at /tank/searxng -- refusing to start, because the compose bind sources would be created in a bare mountpoint and the container would come up on built-in defaults with a throwaway secret_key. Retrying every 30s."; exit 1; }'
+# passes when something ELSE is mounted there.
+#
+# -C is load-bearing too, and its absence made the comment that used to sit here
+# a lie. findmnt canonicalizes its path arguments by default, issuing readlink()
+# against /tank -- so the one guard that runs FIRST, and the only one without a
+# timeout wrapper, would itself block in D-state on a faulted pool. With -C it
+# reads /proc/self/mountinfo and nothing else, which is what the design assumed
+# all along. Verified: same result, zero syscalls against /tank.
+ExecStartPre=/bin/sh -c '/usr/bin/findmnt -C --type zfs --source tank/searxng --mountpoint /tank/searxng --noheadings --output SOURCE,TARGET || { echo "<3>searxng: tank/searxng is NOT mounted at /tank/searxng -- refusing to start, because the compose bind sources would be created in a bare mountpoint and the container would come up on built-in defaults with a throwaway secret_key. Retrying every 30s."; exit 1; }'
 
 # Mounted but empty is the same hazard: without settings.yml the image's
 # entrypoint silently copies its own template into place and rewrites
@@ -76,18 +82,15 @@ ExecStartPre=/bin/sh -c '/usr/bin/findmnt --type zfs --source tank/searxng --mou
 ExecStartPre=/usr/bin/timeout 10 /bin/sh -c 'test -s /tank/searxng/config/settings.yml || { echo "<3>searxng: /tank/searxng/config/settings.yml is missing or empty -- refusing to start, because the entrypoint would generate a default config with a throwaway secret. Run /opt/searxng/install. Retrying every 30s."; exit 1; }'
 
 # Third guard, and it exists because of the second one's timing. systemd reads
-# EnvironmentFile ONCE per start attempt, BEFORE any ExecStartPre runs. On a boot
-# where the pool is late, deploy.env does not exist at that moment, so
-# SEARXNG_BIND_ADDR is unset -- and `-` means that is not an error. Almost always
-# the findmnt guard below then fails and the whole cycle repeats, and systemd
-# genuinely does re-read the file on each auto-restart (measured on this host, not
-# assumed), so it self-heals. The gap is the cycle where the mount lands BETWEEN
-# the environment read and the findmnt check: findmnt passes, the address is still
-# empty, and compose falls back to 127.0.0.1. That failure is the bad kind --
+# EnvironmentFile ONCE per start attempt, BEFORE any ExecStartPre runs. Now that
+# the file is on the root filesystem this is no longer a mount-ordering race, but
+# the assertion is kept: a deleted, renamed or truncated deploy.env is otherwise
+# completely silent, because `-` ignores a missing file and compose's
+# ${VAR:-default} suppresses its own unset warning. That failure is the bad kind --
 # the unit goes active and stays there, healthcheck green, while the reverse proxy
 # on the other host can no longer reach it. Asserting the value is set turns that
 # into one more 30s retry.
-ExecStartPre=/bin/sh -c 'test -n "${SEARXNG_BIND_ADDR}" || { echo "<3>searxng: SEARXNG_BIND_ADDR is empty -- /tank/searxng/deploy.env was unreadable when systemd read the environment (late pool import?). Refusing to start rather than publishing on the loopback fallback where the reverse proxy cannot reach it. Retrying every 30s."; exit 1; }'
+ExecStartPre=/bin/sh -c 'test -n "${SEARXNG_BIND_ADDR}" || { echo "<3>searxng: SEARXNG_BIND_ADDR is empty -- /etc/searxng/deploy.env is missing, truncated, or lacks the key. Refusing to start rather than publishing on the loopback fallback where the reverse proxy cannot reach it. Retrying every 30s."; exit 1; }'
 
 # No `-` prefix on either exec line. It would record a real compose failure as
 # Result=success: the journal logs a clean deactivation instead of "Failed with

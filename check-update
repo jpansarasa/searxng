@@ -23,8 +23,8 @@ export DOCKER_UID="${DOCKER_UID:-2100}" DOCKER_GID="${DOCKER_GID:-2100}"
 # PARSED, never sourced. `.` executes the file as root, and "it is root-owned"
 # is a property that has to be re-established on every install run rather than
 # assumed -- which is exactly the reasoning that moved secrets.env off sourcing.
-if [ -r /tank/searxng/deploy.env ]; then
-    tag=$(grep -m1 -oP '^SEARXNG_TAG=\K.*' /tank/searxng/deploy.env 2>/dev/null || true)
+if [ -r /etc/searxng/deploy.env ]; then
+    tag=$(grep -m1 -oP '^SEARXNG_TAG=\K.*' /etc/searxng/deploy.env 2>/dev/null || true)
     tag=${tag%$'\r'}; tag=${tag#\"}; tag=${tag%\"}
     [ -n "$tag" ] && SEARXNG_TAG="$tag"
 fi
@@ -122,8 +122,8 @@ if [ "$SEARXNG_TAG" != latest ]; then
     upstream=$(docker image inspect --format '{{.Id}}' docker.io/searxng/searxng:latest 2>/dev/null || true)
     if [ -n "$upstream" ] && [ "$upstream" != "$running" ]; then
         echo "note: pinned to $SEARXNG_TAG; upstream :latest has moved ($upstream)."
-        echo "      un-pin by removing SEARXNG_TAG from /tank/searxng/deploy.env, then restart."
+        echo "      un-pin by removing SEARXNG_TAG from /etc/searxng/deploy.env, then restart."
         notify "SearXNG pin can likely be retired" "pushpin,searxng" \
-            "Pinned to $SEARXNG_TAG; upstream :latest has moved. Un-pin: remove SEARXNG_TAG from /tank/searxng/deploy.env, then sudo systemctl restart searxng.service"
+            "Pinned to $SEARXNG_TAG; upstream :latest has moved. Un-pin: remove SEARXNG_TAG from /etc/searxng/deploy.env, then sudo systemctl restart searxng.service"
     fi
 fi

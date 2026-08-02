@@ -26,9 +26,21 @@ SVC_UID=2100
 # Root-only, at the dataset root: not bind-mounted, so out of the container's
 # reach. Holds the two values that must not be public.
 SECRETS="$ROOT/secrets.env"
-# Not secret, but deployment-specific and needed by systemd at start time (it
-# reaches compose as an interpolation), so it cannot live in the repo either.
-DEPLOY_ENV="$ROOT/deploy.env"
+# Not secret, but deployment-specific, so it cannot live in the repo either.
+#
+# On the ROOT filesystem, deliberately NOT on the dataset. systemd reads this as
+# an EnvironmentFile, synchronously, in its own main loop, and BEFORE any
+# ExecStartPre runs -- so with the file on `tank` (failmode=wait) a faulted pool
+# would put PID 1 into uninterruptible sleep, taking systemctl, logins and clean
+# shutdown with it, and the guards written to survive exactly that outage would
+# never be reached.
+#
+# The reason it was ever on the dataset is a rule borrowed from the ntfy repo:
+# put credentials where the backup will capture them. That rule does not apply
+# here. tank/searxng has every com.sun:auto-snapshot:<label> set to false and
+# zero snapshots -- it is deliberately not backed up -- so dataset placement
+# bought no recoverability at all, only the hazard above.
+DEPLOY_ENV=/etc/searxng/deploy.env
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -187,7 +199,16 @@ SEARXNG_SECRET_KEY=$(read_var "$SECRETS" SEARXNG_SECRET_KEY)
 SEARXNG_BASE_URL=$(read_var "$SECRETS" SEARXNG_BASE_URL)
 export SEARXNG_SECRET_KEY SEARXNG_BASE_URL
 
-# 5. Non-secret deployment parameters. Seeded rather than demanded so a fresh
+# 5. Non-secret deployment parameters. Migrate the old dataset location first,
+#    so an existing install carries its values over rather than silently
+#    reverting to seeded blanks and failing the check below.
+mkdir -p /etc/searxng
+if [ -e "$ROOT/deploy.env" ] && [ ! -e "$DEPLOY_ENV" ]; then
+    mv "$ROOT/deploy.env" "$DEPLOY_ENV"
+    echo "install: moved deploy.env off the dataset to $DEPLOY_ENV" >&2
+fi
+
+# Seeded rather than demanded so a fresh
 #    machine shows an empty value instead of a missing file, but still refused
 #    below when empty -- publishing on every interface by accident is how this
 #    instance ended up reachable from the LAN with no auth and no rate limit.
@@ -195,8 +216,11 @@ if [ ! -e "$DEPLOY_ENV" ]; then
     cat > "$DEPLOY_ENV" <<'EOF'
 # Read by searxng.service and searxng-update.service, and passed to compose.
 # Not secret, but deployment-specific, so it is here and not in git.
-# Lives on the dataset; note the dataset is NOT replicated, so a rebuild
-# recreates this file rather than restoring it.
+#
+# On the root filesystem rather than the ZFS dataset on purpose: systemd reads
+# this file before any of the unit's guards run, and a file on a faulted pool
+# would block PID 1. Nothing here is worth preserving anyway -- a rebuild
+# recreates it.
 
 # The single address the published port binds to. This instance has no auth and
 # no rate limiting, so this must be the interface the reverse proxy reaches and
