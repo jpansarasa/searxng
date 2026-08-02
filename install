@@ -28,18 +28,28 @@ SVC_UID=2100
 SECRETS="$ROOT/secrets.env"
 # Not secret, but deployment-specific, so it cannot live in the repo either.
 #
-# On the ROOT filesystem, deliberately NOT on the dataset. systemd reads this as
-# an EnvironmentFile, synchronously, in its own main loop, and BEFORE any
-# ExecStartPre runs -- so with the file on `tank` (failmode=wait) a faulted pool
-# would put PID 1 into uninterruptible sleep, taking systemctl, logins and clean
-# shutdown with it, and the guards written to survive exactly that outage would
-# never be reached.
+# TWO paths, and the split is the same one this repo uses everywhere else:
+# source of truth in durable storage, rendered artifact where it is consumed.
 #
-# The reason it was ever on the dataset is a rule borrowed from the ntfy repo:
-# put credentials where the backup will capture them. That rule does not apply
-# here. tank/searxng has every com.sun:auto-snapshot:<label> set to false and
-# zero snapshots -- it is deliberately not backed up -- so dataset placement
-# bought no recoverability at all, only the hazard above.
+# The SOURCE is on the dataset, with the service it configures. That is the
+# design rule for this machine: ZFS carries services and their data and is
+# physically portable -- pull the drives into a new chassis, or zfs send them to
+# a new box -- while the OS is a separate NVMe that gets rebuilt from an ISO
+# after a dead board or CPU. Service configuration belongs on the half that
+# travels.
+#
+# The RENDER is on the root filesystem, because systemd reads EnvironmentFile in
+# PID 1 itself -- measured, not assumed: strace of pid 1 shows it opening the
+# file five times during one `systemctl restart searxng`. `tank` is
+# failmode=wait, so pointing that read at the pool means a faulted pool can put
+# PID 1 into uninterruptible sleep, taking systemctl, logins and clean shutdown
+# with it. Rendering to /etc keeps the pool out of PID 1's path entirely.
+#
+# The render also filters: only the two keys below are copied through, so the
+# systemd environment cannot be widened by whatever else ends up in the source
+# file. That structurally removes the DOCKER_UID=0 escalation the ownership
+# check further down otherwise has to prevent by hand.
+DEPLOY_SRC="$ROOT/deploy.env"
 DEPLOY_ENV=/etc/searxng/deploy.env
 
 die() { echo "install: $*" >&2; exit 1; }
@@ -199,28 +209,26 @@ SEARXNG_SECRET_KEY=$(read_var "$SECRETS" SEARXNG_SECRET_KEY)
 SEARXNG_BASE_URL=$(read_var "$SECRETS" SEARXNG_BASE_URL)
 export SEARXNG_SECRET_KEY SEARXNG_BASE_URL
 
-# 5. Non-secret deployment parameters. Migrate the old dataset location first,
-#    so an existing install carries its values over rather than silently
-#    reverting to seeded blanks and failing the check below.
+# 5. Non-secret deployment parameters. Carry over a file left at either of the
+#    two locations this has previously lived at, so an existing install keeps
+#    its values instead of silently reverting to seeded blanks.
 mkdir -p /etc/searxng
-if [ -e "$ROOT/deploy.env" ] && [ ! -e "$DEPLOY_ENV" ]; then
-    mv "$ROOT/deploy.env" "$DEPLOY_ENV"
-    echo "install: moved deploy.env off the dataset to $DEPLOY_ENV" >&2
+if [ ! -e "$DEPLOY_SRC" ] && [ -e "$DEPLOY_ENV" ]; then
+    mv "$DEPLOY_ENV" "$DEPLOY_SRC"
+    echo "install: moved deploy.env back onto the dataset ($DEPLOY_SRC is the source of truth)" >&2
 fi
 
 # Seeded rather than demanded so a fresh
 #    machine shows an empty value instead of a missing file, but still refused
 #    below when empty -- publishing on every interface by accident is how this
 #    instance ended up reachable from the LAN with no auth and no rate limit.
-if [ ! -e "$DEPLOY_ENV" ]; then
-    cat > "$DEPLOY_ENV" <<'EOF'
-# Read by searxng.service and searxng-update.service, and passed to compose.
-# Not secret, but deployment-specific, so it is here and not in git.
-#
-# On the root filesystem rather than the ZFS dataset on purpose: systemd reads
-# this file before any of the unit's guards run, and a file on a faulted pool
-# would block PID 1. Nothing here is worth preserving anyway -- a rebuild
-# recreates it.
+if [ ! -e "$DEPLOY_SRC" ]; then
+    cat > "$DEPLOY_SRC" <<'EOF'
+# Deployment parameters for searxng. Not secret, but deployment-specific, so
+# this is here and not in git. THIS FILE IS THE SOURCE OF TRUTH -- edit it and
+# re-run /opt/searxng/install. It lives on the dataset so it travels with the
+# pool to a new chassis; install renders the parts systemd needs to
+# /etc/searxng/deploy.env, which is generated and should not be edited.
 
 # The single address the published port binds to. This instance has no auth and
 # no rate limiting, so this must be the interface the reverse proxy reaches and
@@ -235,20 +243,34 @@ SEARXNG_BIND_ADDR=
 # version here (e.g. 2026.7.1-abc1234), then restart; delete the line to un-pin.
 SEARXNG_TAG=latest
 EOF
-    echo "install: wrote template $DEPLOY_ENV" >&2
+    echo "install: wrote template $DEPLOY_SRC" >&2
 fi
-SEARXNG_BIND_ADDR=$(read_var "$DEPLOY_ENV" SEARXNG_BIND_ADDR)
+SEARXNG_BIND_ADDR=$(read_var "$DEPLOY_SRC" SEARXNG_BIND_ADDR)
+SEARXNG_TAG=$(read_var "$DEPLOY_SRC" SEARXNG_TAG)
 
 missing=()
 [ -n "$SEARXNG_SECRET_KEY" ] || missing+=("SEARXNG_SECRET_KEY in $SECRETS (should have been generated -- check the file)")
 [ -n "$SEARXNG_BASE_URL" ]   || missing+=("SEARXNG_BASE_URL in $SECRETS -- this instance's own public URL, e.g. https://searxng.example.com/")
-[ -n "$SEARXNG_BIND_ADDR" ]  || missing+=("SEARXNG_BIND_ADDR in $DEPLOY_ENV -- the one address to publish on, e.g. the LAN IP your reverse proxy connects to")
+[ -n "$SEARXNG_BIND_ADDR" ]  || missing+=("SEARXNG_BIND_ADDR in $DEPLOY_SRC -- the one address to publish on, e.g. the LAN IP your reverse proxy connects to")
 if [ ${#missing[@]} -gt 0 ]; then
     { echo "install: cannot converge, these deployment values are unset:"; printf '  - %s\n' "${missing[@]}"
       echo; echo "  Set them and re-run. Both files already exist and are on the dataset;"
       echo "  neither can be guessed, which is why they are not in the repo."; } >&2
     exit 1
 fi
+
+#    Render the systemd-visible half. Only these two keys cross over, and the
+#    file is regenerated every run so the dataset copy stays authoritative.
+cat > "$DEPLOY_ENV" <<EOF
+# GENERATED by /opt/searxng/install -- do not edit.
+# Source of truth is $DEPLOY_SRC, on the dataset. Edit that and re-run install.
+# This copy exists only so systemd never reads an EnvironmentFile from the pool:
+# PID 1 opens that file itself, and tank is failmode=wait.
+SEARXNG_BIND_ADDR=$SEARXNG_BIND_ADDR
+SEARXNG_TAG=${SEARXNG_TAG:-latest}
+EOF
+chown root:root "$DEPLOY_ENV"
+chmod 0644 "$DEPLOY_ENV"
 
 # 6. Render config: template (this dir) + values (the dataset) -> live mount.
 #    envsubst gets an explicit variable list so ONLY these placeholders are
@@ -306,10 +328,10 @@ chown -R searxng:searxng "$ROOT/config" "$ROOT/cache"
 #    root -- the one state in which it can read secrets.env by ownership alone.
 #    Root-owning the directory also means nothing but root can unlink the files
 #    in it, which is what actually protects a 0600 file.
-chown root:root "$ROOT" "$SECRETS" "$DEPLOY_ENV"
+chown root:root "$ROOT" "$SECRETS" "$DEPLOY_SRC"
 chmod 0755 "$ROOT"
 chmod 0600 "$SECRETS"
-chmod 0644 "$DEPLOY_ENV"
+chmod 0644 "$DEPLOY_SRC"
 
 # 9. Retire the obsolete pull-not-on-boot drop-in. The base unit no longer
 #    pulls on start (updates come from searxng-update.timer), so the override

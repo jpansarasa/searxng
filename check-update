@@ -20,6 +20,8 @@ export DOCKER_UID="${DOCKER_UID:-2100}" DOCKER_GID="${DOCKER_GID:-2100}"
 # gets it from the same file they use, then falls back to the same default.
 # (`if` rather than `[ -r ] && .` -- the latter returns 1 when absent and would
 # trip set -e.)
+# Reads the RENDERED file, the same one the units read -- not the dataset copy.
+# One read path, and this stays off the pool too.
 # PARSED, never sourced. `.` executes the file as root, and "it is root-owned"
 # is a property that has to be re-established on every install run rather than
 # assumed -- which is exactly the reasoning that moved secrets.env off sourcing.

@@ -19,58 +19,64 @@ as a Docker container under systemd.
 Paths are pinned: the units hardcode `/opt/searxng` and `/tank/searxng`, and
 `install` refuses to run from anywhere else.
 
-## What is not in this repo
+## Where things live
 
-Two files, by design — the repo stays safe to publish:
+This machine splits storage on purpose, and that rule decides every path below.
+
+**ZFS carries services and their data.** The pool is portable: the drives can be
+pulled into a new chassis, or `zfs send` to a new box. It survives a dead board,
+a dead CPU, a dead OS drive.
+
+**The OS is a separate NVMe and is disposable.** It is rebuilt from an ISO. It
+is not where anything you would miss belongs.
+
+So service configuration lives on the dataset, with the service it configures.
 
 | File | Contents | Created by |
 | --- | --- | --- |
 | `/tank/searxng/secrets.env` | `SEARXNG_SECRET_KEY` (generated), `SEARXNG_BASE_URL` (**you**) | `install` seeds it; you fill in the base URL |
-| `/etc/searxng/deploy.env` | `SEARXNG_BIND_ADDR` (**you**), `SEARXNG_TAG` (optional pin) | `install` seeds it; you fill in the address |
+| `/tank/searxng/deploy.env` | `SEARXNG_BIND_ADDR` (**you**), `SEARXNG_TAG` (optional pin) | `install` seeds it; you fill in the address |
 
-They are in **different** places on purpose, and the split is not arbitrary.
+Both are on the dataset. Both are `root:root`, as is the dataset root, and
+neither is ever sourced — both are parsed for known keys only.
 
-`deploy.env` is on the root filesystem because systemd reads it as an
-`EnvironmentFile`, synchronously, in its own main loop, and before any
-`ExecStartPre` runs. On `tank` (which is `failmode=wait`) a faulted pool would
-therefore put PID 1 into uninterruptible sleep — no `systemctl`, no logins, no
-clean shutdown — and the guards written to survive exactly that outage would
-never be reached. It sat on the dataset originally because the sibling `ntfy`
-repo puts its credentials there so the backup captures them; that rule does not
-transfer, because `tank/searxng` has every `com.sun:auto-snapshot:<label>` set
-to false and is deliberately never snapshotted. Dataset placement bought no
-recoverability at all, only the hazard.
+### The one exception, and why
 
-`secrets.env` stays on the dataset because only `install` reads it, and
-`install` already requires the dataset mounted before it does anything — so it
-adds no systemd dependency, and keeping the secret off the OS disk is mildly
-better than putting it there.
+`install` renders a copy of `deploy.env` to **`/etc/searxng/deploy.env`**, and
+that generated copy is the only one systemd ever reads. Do not edit it; it is
+overwritten on every run.
 
-Both are `root:root`, as is the dataset root. That matters for `deploy.env`
-specifically: systemd applies `EnvironmentFile=` **after** `Environment=`, so a
-writable `deploy.env` could set `DOCKER_UID=0` and put the container back to
-running as root — the one state in which it can read `secrets.env` by ownership
-alone. Neither file is ever sourced; both are parsed for known keys only.
+The reason is measured rather than assumed: systemd reads `EnvironmentFile=` in
+**PID 1 itself**. An `strace` of pid 1 shows it opening the file five times
+during a single `systemctl restart searxng`. Since `tank` is `failmode=wait`, an
+`EnvironmentFile=` pointing at the pool means a faulted pool can put PID 1 into
+uninterruptible sleep — no `systemctl`, no logins, no clean shutdown — and the
+`ExecStartPre` guards written to survive exactly that outage sit unreachable
+behind it. Rendering to the root filesystem keeps the pool out of PID 1's path
+while leaving the source of truth on the half that travels.
+
+The render also **filters**: only `SEARXNG_BIND_ADDR` and `SEARXNG_TAG` cross
+over. That is load-bearing, not tidiness. systemd applies `EnvironmentFile=`
+*after* `Environment=`, so anything else appearing in the source file — most
+pointedly `DOCKER_UID=0` — would otherwise put the container back to running as
+root, the one state in which it can read `secrets.env` by ownership alone.
+Verified by injecting exactly that and confirming it does not cross.
 
 `install` generates what it can and refuses to invent what it cannot. It names
 every unset value at once and exits, so a fresh machine takes exactly one
 correction round rather than one per variable.
 
-**The recovery set is this repo plus two values you supply** — the instance's
-public URL and the address to publish on. Neither is derivable, and neither is
-secret in the usual sense; they are simply deployment identity, which is exactly
-what must not be in a public repo.
-
-That holds whichever half of this machine you lose. The root filesystem is ext4
-on NVMe and is rebuilt from an ISO; `tank/searxng` is not snapshotted or
-replicated. Neither location preserves anything, and neither is meant to — which
-is why the whole recovery procedure is a clone, two lines of `sed`, and
-`./install`, and why no step of it involves a restore.
+**The recovery set is this repo plus the dataset.** Move the drives to a new
+chassis, install an OS, clone this repo, run `./install`. The only value that
+does not survive that move intact is `SEARXNG_BIND_ADDR`, which is the address
+of *this* host and is expected to change — `install` refuses to start without
+it, and a wrong one makes compose fail loudly to bind rather than quietly
+publishing somewhere else.
 
 `secrets.env` is `0600 root:root` and sits at the **dataset root**, which
 `compose.yml` does not bind-mount — only `config/` and `cache/` are — so the
 container never sees it. `install` re-asserts that mode after its recursive
-`chown`, which would otherwise hand it to the `searxng` user.
+`chown`.
 
 That split is load-bearing, not tidiness. When the dataset root *was* mounted,
 the container's own uid owned the directory holding `secrets.env`, and directory
@@ -95,10 +101,12 @@ HMAC, and the engine cache password.)
 **`tank/searxng` is not replicated, deliberately.** Replication to the backup
 host is opt-in per dataset (`com.sun:auto-snapshot:*` is false on the pool), and
 searxng is not opted in — verified: every `com.sun:auto-snapshot:<label>`
-property on the dataset is false and it has no snapshots. Everything on it is
+property on the dataset is false and it has no snapshots. That is about
+*snapshots*, not about durability: the pool still travels with the drives, which
+is why configuration belongs on it. What snapshots would add here is
+point-in-time rollback, and nothing on this dataset needs it — everything is
 either in this repo (`settings.yml`, `limiter.toml`), regenerable (the secret,
-the engine caches), or `SEARXNG_BASE_URL` — which is a line of typing, not a
-restore. A rebuild is a clone, two values, and `./install`.
+the engine caches), or two lines of typing.
 
 `check-update` pushes an ntfy notification when an update is staged. It reads
 the token from `/tank/ntfy/notify.env` — ntfy's dataset, since that is an ntfy
@@ -120,7 +128,7 @@ sudo git clone https://github.com/jpansarasa/searxng.git /opt/searxng
 sudo /opt/searxng/install
 
 sudo sed -i 's|^SEARXNG_BASE_URL=.*|SEARXNG_BASE_URL=https://searxng.example.com/|' /tank/searxng/secrets.env
-sudo sed -i 's|^SEARXNG_BIND_ADDR=.*|SEARXNG_BIND_ADDR=10.0.0.5|'                   /etc/searxng/deploy.env
+sudo sed -i 's|^SEARXNG_BIND_ADDR=.*|SEARXNG_BIND_ADDR=10.0.0.5|'                   /tank/searxng/deploy.env
 
 # Second run converges and does not exit until searxng actually answers.
 sudo /opt/searxng/install
@@ -177,21 +185,21 @@ docker logs searxng | head -1
 journalctl -u searxng.service | grep -oE 'SearXNG [0-9.]+-[0-9a-f]+' | uniq
 
 # Pin, then apply
-sudo sed -i 's|^SEARXNG_TAG=.*|SEARXNG_TAG=2026.7.1-abc1234|' /etc/searxng/deploy.env
-sudo systemctl restart searxng.service
+sudo sed -i 's|^SEARXNG_TAG=.*|SEARXNG_TAG=2026.7.1-abc1234|' /tank/searxng/deploy.env
+sudo /opt/searxng/install   # re-renders /etc/searxng/deploy.env, then restarts
 
 # Un-pin once upstream supersedes the bad release
-sudo sed -i 's|^SEARXNG_TAG=.*|SEARXNG_TAG=latest|' /etc/searxng/deploy.env
-sudo systemctl restart searxng.service
+sudo sed -i 's|^SEARXNG_TAG=.*|SEARXNG_TAG=latest|' /tank/searxng/deploy.env
+sudo /opt/searxng/install
 ```
 
-Both units set `SEARXNG_TAG=latest` and then read `/etc/searxng/deploy.env`,
+Both units set `SEARXNG_TAG=latest` and then read the rendered `/etc/searxng/deploy.env`,
 which systemd applies **after** `Environment=` and therefore wins. While pinned,
 `check-update` tracks the **pinned** tag — it will not claim an update is staged
 that a restart would not actually apply. It still watches `latest` separately
 and pushes a one-line "the pin can likely be retired" notice once upstream moves
-past the release you pinned away from. Note the dataset is not replicated, so a
-rebuild starts un-pinned.
+past the release you pinned away from. The pin lives on the dataset, so it survives a
+chassis move; it is deliberately not in git, so it never collides with a pull.
 
 ## Configuration model
 
